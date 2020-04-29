@@ -32,14 +32,7 @@ use anyhow::Context as _;
 use bytes::{buf::ext::BufMutExt, Bytes, BytesMut};
 use filetime::FileTime;
 use futures::Future as _;
-use futures_03::{
-    channel::mpsc,
-    compat::*,
-    future,
-    prelude::*,
-    ready, stream,
-    task::{self, Poll},
-};
+use futures_03::{channel::mpsc, compat::*, future, prelude::*, stream};
 use futures_cpupool::CpuPool;
 use number_prefix::{binary_prefix, Prefixed, Standalone};
 use std::cell::RefCell;
@@ -59,7 +52,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(feature = "dist-client")]
 use std::sync::Mutex;
-use std::task::{Context, Waker};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use std::time::Instant;
 use std::u64;
@@ -502,10 +495,6 @@ impl<C: CommandCreatorSync> SccacheServer<C> {
     where
         F: Future,
     {
-        self._run(Box::pin(shutdown.map(|_| ())))
-    }
-
-    fn _run<'a>(self, shutdown: Pin<Box<dyn Future<Output = ()> + 'a>>) -> io::Result<()> {
         let SccacheServer {
             mut runtime,
             mut listener,
@@ -545,9 +534,8 @@ impl<C: CommandCreatorSync> SccacheServer<C> {
         // inactivity, and this is then select'd with the `shutdown` future
         // passed to this function.
 
-        let shutdown = shutdown.map(|a| {
+        let shutdown = shutdown.map(|_| {
             info!("shutting down due to explicit signal");
-            a
         });
 
         let mut futures = vec![
@@ -586,7 +574,12 @@ impl<C: CommandCreatorSync> SccacheServer<C> {
         // Note that we cap the amount of time this can take, however, as we
         // don't want to wait *too* long.
         runtime
-            .block_on_std(async { time::timeout(Duration::new(30, 0), wait).await })
+            .block_on_std(async {
+                time::timeout(Duration::new(30, 0), wait)
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                    .unwrap_or_else(|e| Err(io::Error::new(io::ErrorKind::Other, e)))
+            })
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         info!("ok, fully shutting down now");
@@ -680,13 +673,13 @@ pub enum ServerMessage {
     Shutdown,
 }
 
-impl<C> Service<SccacheRequest> for SccacheService<C>
+impl<C> Service<SccacheRequest> for Arc<SccacheService<C>>
 where
     C: CommandCreatorSync + 'static,
 {
     type Response = SccacheResponse;
     type Error = Error;
-    type Future = SFuture<Self::Response>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response>>>>;
 
     fn call(&mut self, req: SccacheRequest) -> Self::Future {
         trace!("handle_client");
@@ -696,45 +689,60 @@ where
         // that every message is received.
         drop(self.tx.clone().start_send(ServerMessage::Request));
 
-        let res: SFuture<Response> = match req.into_inner() {
-            Request::Compile(compile) => {
-                debug!("handle_client: compile");
-                self.stats.borrow_mut().compile_requests += 1;
-                return self.handle_compile(compile);
+        let self_ = self.clone();
+        Box::pin(async move {
+            match req.into_inner() {
+                Request::Compile(compile) => {
+                    debug!("handle_client: compile");
+                    self_.stats.borrow_mut().compile_requests += 1;
+                    self_.handle_compile(compile).await
+                }
+                Request::GetStats => {
+                    debug!("handle_client: get_stats");
+                    self_
+                        .get_info()
+                        .await
+                        .map(|i| Response::Stats(Box::new(i)))
+                        .map(Message::WithoutBody)
+                }
+                Request::DistStatus => {
+                    debug!("handle_client: dist_status");
+                    self_
+                        .get_dist_status()
+                        .await
+                        .map(Response::DistStatus)
+                        .map(Message::WithoutBody)
+                }
+                Request::ZeroStats => {
+                    debug!("handle_client: zero_stats");
+                    self_.zero_stats();
+                    self_
+                        .get_info()
+                        .await
+                        .map(|i| Response::Stats(Box::new(i)))
+                        .map(Message::WithoutBody)
+                }
+                Request::Shutdown => {
+                    debug!("handle_client: shutdown");
+                    let mut tx = self_.tx.clone();
+                    future::try_join(
+                        async {
+                            let _ = tx.send(ServerMessage::Shutdown).await;
+                            Ok(())
+                        },
+                        self_.get_info(),
+                    )
+                    .await
+                    .map(move |(_, info)| {
+                        Message::WithoutBody(Response::ShuttingDown(Box::new(info)))
+                    })
+                }
             }
-            Request::GetStats => {
-                debug!("handle_client: get_stats");
-                Box::new(self.get_info().map(|i| Response::Stats(Box::new(i))))
-            }
-            Request::DistStatus => {
-                debug!("handle_client: dist_status");
-                Box::new(self.get_dist_status().map(Response::DistStatus))
-            }
-            Request::ZeroStats => {
-                debug!("handle_client: zero_stats");
-                self.zero_stats();
-                Box::new(self.get_info().map(|i| Response::Stats(Box::new(i))))
-            }
-            Request::Shutdown => {
-                debug!("handle_client: shutdown");
-                let mut tx = self.tx.clone();
-                let future = Box::pin(async move {
-                    let _ = tx.send(ServerMessage::Shutdown).await;
-                    Ok(())
-                })
-                .compat();
-                let info_future = self.get_info();
-                return Box::new(future.join(info_future).map(move |(_, info)| {
-                    Message::WithoutBody(Response::ShuttingDown(Box::new(info)))
-                }));
-            }
-        };
-
-        Box::new(res.map(Message::WithoutBody))
+        })
     }
 
-    fn poll_ready(&mut self) -> futures::Poll<(), Self::Error> {
-        Ok(futures::Async::Ready(()))
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -763,7 +771,7 @@ where
         }
     }
 
-    fn bind<T>(mut self, socket: T) -> impl Future<Output = Result<()>>
+    fn bind<T>(self, socket: T) -> impl Future<Output = Result<()>>
     where
         T: AsyncRead + AsyncWrite + Unpin + 'static,
     {
@@ -783,26 +791,19 @@ where
         .split();
         let sink = sink.sink_err_into::<Error>();
 
+        let mut self_ = Arc::new(self);
         stream
             .err_into::<Error>()
-            .and_then(move |input| self.call(input).compat())
+            .and_then(move |input| self_.call(input))
             .and_then(|message| async move {
                 let f: Pin<Box<dyn Stream<Item = _>>> = match message {
-                    Message::WithoutBody(message) => Box::pin(stream::once(async {
-                        Ok(Frame::Message {
-                            message,
-                            body: false,
-                        })
-                    })),
+                    Message::WithoutBody(message) => {
+                        Box::pin(stream::once(async { Ok(Frame::Message { message }) }))
+                    }
                     Message::WithBody(message, body) => Box::pin(
-                        stream::once(async {
-                            Ok(Frame::Message {
-                                message,
-                                body: true,
-                            })
-                        })
-                        .chain(body.map_ok(|chunk| Frame::Body { chunk: Some(chunk) }))
-                        .chain(stream::once(async { Ok(Frame::Body { chunk: None }) })),
+                        stream::once(async { Ok(Frame::Message { message }) })
+                            .chain(body.map_ok(|chunk| Frame::Body { chunk: Some(chunk) }))
+                            .chain(stream::once(async { Ok(Frame::Body { chunk: None }) })),
                     ),
                 };
                 Ok(f.err_into::<Error>())
@@ -813,25 +814,25 @@ where
     }
 
     /// Get dist status.
-    fn get_dist_status(&self) -> SFuture<DistInfo> {
-        f_ok(self.dist_client.get_status())
+    async fn get_dist_status(&self) -> Result<DistInfo> {
+        Ok(self.dist_client.get_status())
     }
 
     /// Get info and stats about the cache.
-    fn get_info(&self) -> SFuture<ServerInfo> {
+    async fn get_info(&self) -> Result<ServerInfo> {
         let stats = self.stats.borrow().clone();
         let cache_location = self.storage.location();
-        Box::new(
-            self.storage
-                .current_size()
-                .join(self.storage.max_size())
-                .map(move |(cache_size, max_cache_size)| ServerInfo {
-                    stats,
-                    cache_location,
-                    cache_size,
-                    max_cache_size,
-                }),
+        future::try_join(
+            self.storage.current_size().compat(),
+            self.storage.max_size().compat(),
         )
+        .await
+        .map(move |(cache_size, max_cache_size)| ServerInfo {
+            stats,
+            cache_location,
+            cache_size,
+            max_cache_size,
+        })
     }
 
     /// Zero stats about the cache.
@@ -844,27 +845,25 @@ where
     /// This will handle a compile request entirely, generating a response with
     /// the inital information and an optional body which will eventually
     /// contain the results of the compilation.
-    fn handle_compile(&self, compile: Compile) -> SFuture<SccacheResponse> {
+    async fn handle_compile(&self, compile: Compile) -> Result<SccacheResponse> {
         let exe = compile.exe;
         let cmd = compile.args;
         let cwd: PathBuf = compile.cwd.into();
         let env_vars = compile.env_vars;
         let me = self.clone();
 
-        Box::new(
-            self.compiler_info(exe.into(), cwd.clone(), &env_vars)
-                .map(move |info| me.check_compiler(info, cmd, cwd, env_vars)),
-        )
+        let info = self.compiler_info(exe.into(), cwd.clone(), &env_vars).await;
+        Ok(me.check_compiler(info, cmd, cwd, env_vars))
     }
 
     /// Look up compiler info from the cache for the compiler `path`.
     /// If not cached, determine the compiler type and cache the result.
-    fn compiler_info(
+    async fn compiler_info(
         &self,
         path: PathBuf,
         cwd: PathBuf,
         env: &[(OsString, OsString)],
-    ) -> SFuture<Result<Box<dyn Compiler<C>>>> {
+    ) -> Result<Box<dyn Compiler<C>>> {
         trace!("compiler_info");
 
         let me = self.clone();
@@ -879,152 +878,127 @@ where
             .cloned()
             .collect::<Vec<(OsString, OsString)>>();
 
-        let resolve_w_proxy = {
+        let res: Option<(PathBuf, FileTime)> = {
             let compiler_proxies_borrow = self.compiler_proxies.borrow();
 
             if let Some((compiler_proxy, _filetime)) = compiler_proxies_borrow.get(&path) {
-                let fut = compiler_proxy.resolve_proxied_executable(
-                    self.creator.clone(),
-                    cwd.clone(),
-                    env.as_slice(),
-                );
-                Box::new(fut.then(|res: Result<_>| Ok(res.ok())))
+                let fut = compiler_proxy
+                    .resolve_proxied_executable(self.creator.clone(), cwd.clone(), env.as_slice())
+                    .compat();
+                Box::pin(fut.map(|res: Result<_>| res.ok())) as Pin<Box<dyn Future<Output = _>>>
             } else {
-                f_ok(None)
+                Box::pin(async { None })
+            }
+        }
+        .await;
+
+        // use the supplied compiler path as fallback, lookup its modification time too
+
+        let (resolved_compiler_path, mtime) = match res {
+            Some(x) => x, // TODO resolve the path right away
+            None => {
+                // fallback to using the path directly
+                metadata(&path2)
+                    .map(|attr| FileTime::from_last_modification_time(&attr))
+                    .ok()
+                    .map(move |filetime| (path2.clone(), filetime))
+                    .expect("Must contain sane data, otherwise mtime is not avail")
             }
         };
 
-        // use the supplied compiler path as fallback, lookup its modification time too
-        let w_fallback = resolve_w_proxy.then(move |res: Result<Option<(PathBuf, FileTime)>>| {
-            let opt = match res {
-                Ok(Some(x)) => Some(x), // TODO resolve the path right away
-                _ => {
-                    // fallback to using the path directly
-                    metadata(&path2)
+        let dist_info = match me1.dist_client.get_client() {
+            Ok(Some(ref client)) => {
+                if let Some(archive) = client.get_custom_toolchain(&resolved_compiler_path) {
+                    match metadata(&archive)
                         .map(|attr| FileTime::from_last_modification_time(&attr))
-                        .ok()
-                        .map(move |filetime| (path2.clone(), filetime))
+                    {
+                        Ok(mtime) => Some((archive, mtime)),
+                        _ => None,
+                    }
+                } else {
+                    None
                 }
-            };
-            f_ok(opt)
-        });
+            }
+            _ => None,
+        };
 
-        let lookup_compiler = w_fallback.and_then(move |opt: Option<(PathBuf, FileTime)>| {
-            let (resolved_compiler_path, mtime) =
-                opt.expect("Must contain sane data, otherwise mtime is not avail");
+        let opt = match me1.compilers.borrow().get(&resolved_compiler_path) {
+            // It's a hit only if the mtime and dist archive data matches.
+            Some(&Some(ref entry)) => {
+                if entry.mtime == mtime && entry.dist_info == dist_info {
+                    Some(entry.compiler.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
 
-            let dist_info = match me1.dist_client.get_client() {
-                Ok(Some(ref client)) => {
-                    if let Some(archive) = client.get_custom_toolchain(&resolved_compiler_path) {
-                        match metadata(&archive)
-                            .map(|attr| FileTime::from_last_modification_time(&attr))
-                        {
-                            Ok(mtime) => Some((archive, mtime)),
-                            _ => None,
+        match opt {
+            Some(info) => {
+                trace!("compiler_info cache hit");
+                Ok(info)
+            }
+            None => {
+                trace!("compiler_info cache miss");
+                // Check the compiler type and return the result when
+                // finished. This generally involves invoking the compiler,
+                // so do it asynchronously.
+
+                // the compiler path might be compiler proxy, so it is important to use
+                // `path` (or its clone `path1`) to resolve using that one, not using `resolved_compiler_path`
+                let info: Result<(Box<dyn Compiler<C>>, Option<Box<dyn CompilerProxy<C>>>)> =
+                    get_compiler_info::<C>(
+                        me.creator.clone(),
+                        &path1,
+                        &cwd,
+                        env.as_slice(),
+                        &me.pool,
+                        dist_info.clone().map(|(p, _)| p),
+                    )
+                    .compat()
+                    .await;
+
+                match info {
+                    Ok((ref c, ref proxy)) => {
+                        // register the proxy for this compiler, so it will be used directly from now on
+                        // and the true/resolved compiler will create table hits in the hash map
+                        // based on the resolved path
+                        if let Some(proxy) = proxy {
+                            trace!(
+                                "Inserting new path proxy {:?} @ {:?} -> {:?}",
+                                &path,
+                                &cwd,
+                                resolved_compiler_path
+                            );
+                            let proxy: Box<dyn CompilerProxy<C>> = proxy.box_clone();
+                            me.compiler_proxies
+                                .borrow_mut()
+                                .insert(path, (proxy, mtime.clone()));
                         }
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
+                        // TODO add some safety checks in case a proxy exists, that the initial `path` is not
+                        // TODO the same as the resolved compiler binary
 
-            let opt = match me1.compilers.borrow().get(&resolved_compiler_path) {
-                // It's a hit only if the mtime and dist archive data matches.
-                Some(&Some(ref entry)) => {
-                    if entry.mtime == mtime && entry.dist_info == dist_info {
-                        Some(entry.compiler.clone())
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            f_ok((resolved_compiler_path, mtime, opt, dist_info))
-        });
-
-        let obtain = lookup_compiler.and_then(
-            move |(resolved_compiler_path, mtime, opt, dist_info): (
-                PathBuf,
-                FileTime,
-                Option<Box<dyn Compiler<C>>>,
-                Option<(PathBuf, FileTime)>,
-            )| {
-                match opt {
-                    Some(info) => {
-                        trace!("compiler_info cache hit");
-                        f_ok(Ok(info))
-                    }
-                    None => {
-                        trace!("compiler_info cache miss");
-                        // Check the compiler type and return the result when
-                        // finished. This generally involves invoking the compiler,
-                        // so do it asynchronously.
-
-                        // the compiler path might be compiler proxy, so it is important to use
-                        // `path` (or its clone `path1`) to resolve using that one, not using `resolved_compiler_path`
-                        let x = get_compiler_info::<C>(
-                            me.creator.clone(),
-                            &path1,
-                            &cwd,
-                            env.as_slice(),
-                            &me.pool,
-                            dist_info.clone().map(|(p, _)| p),
+                        // cache
+                        let map_info = CompilerCacheEntry::new(c.clone(), mtime, dist_info);
+                        trace!(
+                            "Inserting POSSIBLY PROXIED cache map info for {:?}",
+                            &resolved_compiler_path
                         );
-
-                        Box::new(x.then(
-                            move |info: Result<(
-                                Box<dyn Compiler<C>>,
-                                Option<Box<dyn CompilerProxy<C>>>,
-                            )>| {
-                                match info {
-                                    Ok((ref c, ref proxy)) => {
-                                        // register the proxy for this compiler, so it will be used directly from now on
-                                        // and the true/resolved compiler will create table hits in the hash map
-                                        // based on the resolved path
-                                        if let Some(proxy) = proxy {
-                                            trace!(
-                                                "Inserting new path proxy {:?} @ {:?} -> {:?}",
-                                                &path,
-                                                &cwd,
-                                                resolved_compiler_path
-                                            );
-                                            let proxy: Box<dyn CompilerProxy<C>> =
-                                                proxy.box_clone();
-                                            me.compiler_proxies
-                                                .borrow_mut()
-                                                .insert(path, (proxy, mtime.clone()));
-                                        }
-                                        // TODO add some safety checks in case a proxy exists, that the initial `path` is not
-                                        // TODO the same as the resolved compiler binary
-
-                                        // cache
-                                        let map_info =
-                                            CompilerCacheEntry::new(c.clone(), mtime, dist_info);
-                                        trace!(
-                                            "Inserting POSSIBLY PROXIED cache map info for {:?}",
-                                            &resolved_compiler_path
-                                        );
-                                        me.compilers
-                                            .borrow_mut()
-                                            .insert(resolved_compiler_path, Some(map_info));
-                                    }
-                                    Err(_) => {
-                                        trace!("Inserting PLAIN cache map info for {:?}", &path);
-                                        me.compilers.borrow_mut().insert(path, None);
-                                    }
-                                }
-                                // drop the proxy information, response is compiler only
-                                let r: Result<Box<dyn Compiler<C>>> = info.map(|info| info.0);
-                                f_ok(r)
-                            },
-                        ))
+                        me.compilers
+                            .borrow_mut()
+                            .insert(resolved_compiler_path, Some(map_info));
+                    }
+                    Err(_) => {
+                        trace!("Inserting PLAIN cache map info for {:?}", &path);
+                        me.compilers.borrow_mut().insert(path, None);
                     }
                 }
-            },
-        );
-
-        return Box::new(obtain);
+                // drop the proxy information, response is compiler only
+                let r: Result<Box<dyn Compiler<C>>> = info.map(|info| info.0);
+                r
+            }
+        }
     }
 
     /// Check that we can handle and cache `cmd` when run with `compiler`.
@@ -1104,25 +1078,28 @@ where
         };
         let out_pretty = hasher.output_pretty().into_owned();
         let color_mode = hasher.color_mode();
-        let result = hasher.get_cached_or_compile(
-            self.dist_client.get_client(),
-            self.creator.clone(),
-            self.storage.clone(),
-            arguments,
-            cwd,
-            env_vars,
-            cache_control,
-            self.pool.clone(),
-        );
+        let result = hasher
+            .get_cached_or_compile(
+                self.dist_client.get_client(),
+                self.creator.clone(),
+                self.storage.clone(),
+                arguments,
+                cwd,
+                env_vars,
+                cache_control,
+                self.pool.clone(),
+            )
+            .compat();
         let me = self.clone();
         let kind = compiler.kind();
-        let task = result.then(move |result| {
+        let task = async move {
+            let result = result.await;
             let mut cache_write = None;
-            let mut stats = me.stats.borrow_mut();
             let mut res = CompileFinished::default();
             res.color_mode = color_mode;
             match result {
                 Ok((compiled, out)) => {
+                    let mut stats = me.stats.borrow_mut();
                     match compiled {
                         CompileResult::Error => {
                             stats.cache_errors.increment(&kind);
@@ -1156,7 +1133,7 @@ where
                             }
                             stats.cache_misses.increment(&kind);
                             stats.cache_read_miss_duration += duration;
-                            cache_write = Some(future);
+                            cache_write = Some(future.compat());
                         }
                         CompileResult::NotCacheable => {
                             stats.cache_misses.increment(&kind);
@@ -1180,6 +1157,7 @@ where
                     res.stderr = stderr;
                 }
                 Err(err) => {
+                    let mut stats = me.stats.borrow_mut();
                     match err.downcast::<ProcessError>() {
                         Ok(ProcessError(output)) => {
                             debug!("Compilation failed: {:?}", output);
@@ -1223,15 +1201,15 @@ where
             let send = Box::pin(async move { tx.send(Ok(Response::CompileFinished(res))).await });
 
             let me = me.clone();
-            let cache_write = cache_write
-                .then(move |result| {
-                    match result {
+            let cache_write = async {
+                if let Some(cache_write) = cache_write {
+                    match cache_write.await {
                         Err(e) => {
                             debug!("Error executing cache write: {}", e);
                             me.stats.borrow_mut().cache_write_errors += 1;
                         }
                         //TODO: save cache stats!
-                        Ok(Some(info)) => {
+                        Ok(info) => {
                             debug!(
                                 "[{}]: Cache write finished in {}",
                                 info.object_file_pretty,
@@ -1240,18 +1218,16 @@ where
                             me.stats.borrow_mut().cache_writes += 1;
                             me.stats.borrow_mut().cache_write_duration += info.duration;
                         }
-
-                        Ok(None) => {}
                     }
-                    Ok(())
-                })
-                .compat();
+                }
+                Ok(())
+            };
 
-            future::try_join(send, cache_write).map(|_| Ok(())).compat()
-        });
+            future::try_join(send, cache_write).map(|_| Ok(())).await
+        };
 
         tokio_compat::runtime::current_thread::TaskExecutor::current()
-            .spawn_local(Box::new(task))
+            .spawn_local(Box::new(Box::pin(task).compat()))
             .unwrap();
     }
 }
@@ -1556,7 +1532,7 @@ impl ServerInfo {
 
 enum Frame<R, R1> {
     Body { chunk: Option<R1> },
-    Message { message: R, body: bool },
+    Message { message: R },
 }
 
 struct Body<R> {
@@ -1654,34 +1630,33 @@ struct SccacheTransport<I: AsyncRead + AsyncWrite + Unpin> {
 impl<I: AsyncRead + AsyncWrite + Unpin> Stream for SccacheTransport<I> {
     type Item = Result<Message<Request, Body<()>>>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Ready(
-            ready!(Stream::poll_next(Pin::new(&mut self.inner), cx))
-                .map(|r| r.map(Message::WithoutBody)),
-        )
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner)
+            .poll_next(cx)
+            .map(|r| r.map(|s| s.map(Message::WithoutBody)))
     }
 }
 
 impl<I: AsyncRead + AsyncWrite + Unpin> Sink<Frame<Response, Response>> for SccacheTransport<I> {
     type Error = Error;
 
-    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<()>> {
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         Pin::new(&mut self.inner).poll_ready(cx)
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Frame<Response, Response>) -> Result<()> {
         match item {
-            Frame::Message { message, body: _ } => Pin::new(&mut self.inner).start_send(message),
+            Frame::Message { message } => Pin::new(&mut self.inner).start_send(message),
             Frame::Body { chunk: Some(chunk) } => Pin::new(&mut self.inner).start_send(chunk),
             Frame::Body { chunk: None } => Ok(()),
         }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<()>> {
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         Pin::new(&mut self.inner).poll_close(cx)
     }
 }
@@ -1695,24 +1670,24 @@ struct ShutdownOrInactive {
 impl Future for ShutdownOrInactive {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<()> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         loop {
             match Pin::new(&mut self.rx).poll_next(cx) {
                 Poll::Pending => break,
                 // Shutdown received!
-                Poll::Ready(Some(ServerMessage::Shutdown)) => return ().into(),
+                Poll::Ready(Some(ServerMessage::Shutdown)) => return Poll::Ready(()),
                 Poll::Ready(Some(ServerMessage::Request)) => {
                     if self.timeout_dur != Duration::new(0, 0) {
                         self.timeout = Some(delay_for(self.timeout_dur));
                     }
                 }
                 // All services have shut down, in theory this isn't possible...
-                Poll::Ready(None) => return ().into(),
+                Poll::Ready(None) => return Poll::Ready(()),
             }
         }
         match self.timeout {
             None => Poll::Pending,
-            Some(ref mut timeout) => ready!(Pin::new(timeout).poll(cx)).into(),
+            Some(ref mut timeout) => Pin::new(timeout).poll(cx),
         }
     }
 }
