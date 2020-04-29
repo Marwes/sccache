@@ -23,7 +23,7 @@ use crate::server::{self, DistInfo, ServerInfo, ServerStartup};
 use crate::util::daemonize;
 use atty::Stream;
 use byteorder::{BigEndian, ByteOrder};
-use futures::Future;
+use futures_03::{compat::*, prelude::*};
 use log::Level::Trace;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -34,10 +34,9 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process;
 use strip_ansi_escapes::Writer;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::time;
 use tokio_compat::runtime::current_thread::Runtime;
-use tokio_io::io::read_exact;
-use tokio_io::AsyncRead;
-use tokio_timer::Timeout;
 use which::which_in;
 
 use crate::errors::*;
@@ -56,33 +55,29 @@ fn get_port() -> u16 {
         .unwrap_or(DEFAULT_PORT)
 }
 
-fn read_server_startup_status<R: AsyncRead>(
-    server: R,
-) -> impl Future<Item = ServerStartup, Error = Error> {
+async fn read_server_startup_status<R>(mut server: R) -> Result<ServerStartup>
+where
+    R: AsyncRead + std::marker::Unpin,
+{
     // This is an async equivalent of ServerConnection::read_one_response
-    read_exact(server, [0u8; 4])
-        .map_err(Error::from)
-        .and_then(|(server, bytes)| {
-            let len = BigEndian::read_u32(&bytes);
-            let data = vec![0; len as usize];
-            read_exact(server, data)
-                .map_err(Error::from)
-                .and_then(|(_server, data)| Ok(bincode::deserialize(&data)?))
-        })
+    let mut bytes = [0u8; 4];
+    server.read_exact(&mut bytes).await?;
+    let len = BigEndian::read_u32(&bytes);
+    let mut data = vec![0; len as usize];
+    server.read_exact(&mut data).await?;
+    Ok(bincode::deserialize(&data)?)
 }
 
 /// Re-execute the current executable as a background server, and wait
 /// for it to start up.
 #[cfg(not(windows))]
 fn run_server_process() -> Result<ServerStartup> {
-    use futures::Stream;
     use std::time::Duration;
 
     trace!("run_server_process");
     let tempdir = tempfile::Builder::new().prefix("sccache").tempdir()?;
     let socket_path = tempdir.path().join("sock");
     let mut runtime = Runtime::new()?;
-    let listener = tokio_uds::UnixListener::bind(&socket_path)?;
     let exe_path = env::current_exe()?;
     let _child = process::Command::new(exe_path)
         .env("SCCACHE_START_SERVER", "1")
@@ -90,23 +85,18 @@ fn run_server_process() -> Result<ServerStartup> {
         .env("RUST_BACKTRACE", "1")
         .spawn()?;
 
-    let startup = listener.incoming().into_future().map_err(|e| e.0);
-    let startup = startup.map_err(Error::from).and_then(|(socket, _rest)| {
-        let socket = socket.unwrap(); // incoming() never returns None
-        read_server_startup_status(socket)
-    });
+    let startup = async {
+        let mut listener = tokio::net::UnixListener::bind(&socket_path)?;
+        let socket = listener.incoming().next().await.unwrap()?; // incoming() never returns None
+        read_server_startup_status(socket).await
+    };
 
-    let timeout = Duration::from_millis(SERVER_STARTUP_TIMEOUT_MS.into());
-    let timeout = Timeout::new(startup, timeout).or_else(|err| {
-        if err.is_elapsed() {
-            Ok(ServerStartup::TimedOut)
-        } else if err.is_inner() {
-            Err(err.into_inner().unwrap())
-        } else {
-            Err(err.into_timer().unwrap().into())
-        }
-    });
-    runtime.block_on(timeout)
+    runtime.block_on_std(async {
+        let timeout = Duration::from_millis(SERVER_STARTUP_TIMEOUT_MS.into());
+        time::timeout(timeout, startup)
+            .unwrap_or_else(|_err| Ok(ServerStartup::TimedOut))
+            .await
+    })
 }
 
 #[cfg(not(windows))]
@@ -245,19 +235,14 @@ fn run_server_process() -> Result<ServerStartup> {
         return Err(io::Error::last_os_error().into());
     }
 
-    let result = read_server_startup_status(server);
+    runtime.block_on_std(async {
+        let result = read_server_startup_status(server);
 
-    let timeout = Duration::from_millis(SERVER_STARTUP_TIMEOUT_MS.into());
-    let timeout = Timeout::new(result, timeout).or_else(|err| {
-        if err.is_elapsed() {
-            Ok(ServerStartup::TimedOut)
-        } else if err.is_inner() {
-            Err(err.into_inner().unwrap().into())
-        } else {
-            Err(err.into_timer().unwrap().into())
-        }
-    });
-    runtime.block_on(timeout)
+        let timeout = Duration::from_millis(SERVER_STARTUP_TIMEOUT_MS.into());
+        time::timeout(timeout, result)
+            .unwrap_or_else(|_err| Ok(ServerStartup::TimedOut))
+            .await
+    })
 }
 
 /// Attempt to connect to an sccache server listening on `port`, or start one if no server is running.
@@ -498,10 +483,10 @@ where
     if log_enabled!(Trace) {
         trace!("running command: {:?}", cmd);
     }
-    let status = runtime.block_on(
-        cmd.spawn()
-            .and_then(|c| c.wait().fcontext("failed to wait for child")),
-    )?;
+    let status = runtime.block_on_std(async {
+        let c = cmd.spawn().compat().await?;
+        c.wait().fcontext("failed to wait for child").compat().await
+    })?;
 
     Ok(status.code().unwrap_or_else(|| {
         if let Some(sig) = status_signal(status) {
@@ -668,11 +653,15 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             let out_file = File::create(out)?;
             let cwd = env::current_dir().expect("A current working dir should exist");
 
-            let compiler =
-                compiler::get_compiler_info(creator, &executable, &cwd, &env, &pool, None);
-            let packager = compiler.map(|c| c.0.get_toolchain_packager());
-            let res = packager.and_then(|p| p.write_pkg(out_file));
-            runtime.block_on(res)?
+            runtime.block_on_std(async {
+                let compiler =
+                    compiler::get_compiler_info(creator, &executable, &cwd, &env, &pool, None)
+                        .compat();
+                let packager = compiler.map_ok(|c| c.0.get_toolchain_packager());
+                packager
+                    .and_then(|p| async move { p.write_pkg(out_file) })
+                    .await
+            })?
         }
         #[cfg(not(feature = "dist-client"))]
         Command::PackageToolchain(_executable, _out) => bail!(
