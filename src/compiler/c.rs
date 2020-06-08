@@ -23,7 +23,7 @@ use crate::dist;
 use crate::dist::pkg;
 use crate::mock_command::CommandCreatorSync;
 use crate::util::{hash_all, Digest, HashToDigest};
-use futures::Future;
+use futures_01::Future;
 use futures_03::compat::*;
 use futures_cpupool::CpuPool;
 use std::borrow::Cow;

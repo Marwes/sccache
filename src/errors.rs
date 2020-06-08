@@ -13,8 +13,8 @@
 // limitations under the License.
 
 pub use anyhow::{anyhow, bail, Context, Error};
-use futures::future;
-use futures::Future;
+use futures_01::future;
+use futures_01::Future;
 use std::boxed::Box;
 use std::fmt::Display;
 use std::process;
@@ -106,7 +106,7 @@ macro_rules! ftry {
     ($e:expr) => {
         match $e {
             Ok(v) => v,
-            Err(e) => return Box::new(futures::future::err(e.into())) as SFuture<_>,
+            Err(e) => return Box::new(futures_01::future::err(e.into())) as SFuture<_>,
         }
     };
 }
@@ -116,7 +116,7 @@ macro_rules! ftry_send {
     ($e:expr) => {
         match $e {
             Ok(v) => v,
-            Err(e) => return Box::new(futures::future::err(e)) as SFutureSend<_>,
+            Err(e) => return Box::new(futures_01::future::err(e)) as SFutureSend<_>,
         }
     };
 }

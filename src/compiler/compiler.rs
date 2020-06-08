@@ -27,7 +27,7 @@ use crate::dist::pkg;
 use crate::mock_command::{exit_status, CommandChild, CommandCreatorSync, RunCommand};
 use crate::util::{fmt_duration_as_secs, ref_env, run_input_output};
 use filetime::FileTime;
-use futures::Future;
+use futures_01::Future;
 use futures_03::compat::*;
 use futures_cpupool::CpuPool;
 use std::borrow::Cow;
@@ -414,7 +414,7 @@ fn dist_or_local_compile<T>(
 where
     T: CommandCreatorSync,
 {
-    use futures::future;
+    use futures_01::future;
     use std::io;
 
     let rewrite_includes_only = match dist_client {
@@ -1073,7 +1073,7 @@ mod test {
     use crate::mock_command::*;
     use crate::test::mock_storage::MockStorage;
     use crate::test::utils::*;
-    use futures::Future;
+    use futures_01::Future;
     use futures_cpupool::CpuPool;
     use std::fs::{self, File};
     use std::io::Write;

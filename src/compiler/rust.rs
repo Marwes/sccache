@@ -26,7 +26,7 @@ use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{fmt_duration_as_secs, hash_all, run_input_output, Digest};
 use crate::util::{ref_env, HashToDigest, OsStrExt};
 use filetime::FileTime;
-use futures::Future;
+use futures_01::Future;
 use futures_03::{compat::*, future};
 use futures_cpupool::CpuPool;
 use log::Level::Trace;

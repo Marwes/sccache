@@ -31,7 +31,7 @@ use crate::util;
 use anyhow::Context as _;
 use bytes::{buf::ext::BufMutExt, Bytes, BytesMut};
 use filetime::FileTime;
-use futures::Future as _;
+use futures_01::Future as _;
 use futures_03::{channel::mpsc, compat::*, future, prelude::*, stream};
 use futures_cpupool::CpuPool;
 use number_prefix::{binary_prefix, Prefixed, Standalone};

@@ -20,7 +20,7 @@ use crate::compiler::{
 use crate::dist;
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::run_input_output;
-use futures::future::Future;
+use futures_01::future::Future;
 use futures_03::compat::*;
 use futures_cpupool::CpuPool;
 use local_encoding::{Encoder, Encoding};
@@ -824,7 +824,7 @@ mod test {
     use crate::env;
     use crate::mock_command::*;
     use crate::test::utils::*;
-    use futures::Future;
+    use futures_01::Future;
     use futures_cpupool::CpuPool;
 
     fn parse_arguments(arguments: Vec<OsString>) -> CompilerArguments<ParsedArguments> {

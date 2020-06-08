@@ -135,7 +135,7 @@ fn redirect_error_log() -> Result<()> {
 /// Re-execute the current executable as a background server.
 #[cfg(windows)]
 fn run_server_process() -> Result<ServerStartup> {
-    use futures::future;
+    use futures_01::future;
     use std::mem;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;

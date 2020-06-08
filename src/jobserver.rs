@@ -2,10 +2,10 @@ use std::io;
 use std::process::Command;
 use std::sync::Arc;
 
-use futures::future;
-use futures::prelude::*;
-use futures::sync::mpsc;
-use futures::sync::oneshot;
+use futures_01::future;
+use futures_01::prelude::*;
+use futures_01::sync::mpsc;
+use futures_01::sync::oneshot;
 
 use crate::errors::*;
 

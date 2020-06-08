@@ -22,7 +22,7 @@ pub use self::server::{
 
 mod common {
     #[cfg(feature = "dist-client")]
-    use futures::{Future, Stream};
+    use futures_01::{Future, Stream};
     use hyperx::header;
     #[cfg(feature = "dist-server")]
     use std::collections::HashMap;
@@ -1061,7 +1061,7 @@ mod client {
     use byteorder::{BigEndian, WriteBytesExt};
     use flate2::write::ZlibEncoder as ZlibWriteEncoder;
     use flate2::Compression;
-    use futures::Future;
+    use futures_01::Future;
     use futures_cpupool::CpuPool;
     use std::collections::HashMap;
     use std::io::Write;
