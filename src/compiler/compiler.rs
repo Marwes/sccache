@@ -131,6 +131,7 @@ impl<T: CommandCreatorSync> Clone for Box<dyn Compiler<T>> {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 pub trait CompilerProxy<T>: Send + 'static
 where
     T: CommandCreatorSync + Sized,
@@ -140,12 +141,12 @@ where
     /// Returns the absolute path to the true compiler and the timestamp of
     /// timestamp of the true compiler. Iff the resolution fails,
     /// the returned future resolves to an error with more information.
-    fn resolve_proxied_executable(
+    async fn resolve_proxied_executable(
         &self,
         creator: T,
         cwd: PathBuf,
         env_vars: &[(OsString, OsString)],
-    ) -> SFuture<(PathBuf, FileTime)>;
+    ) -> Result<(PathBuf, FileTime)>;
 
     /// Create a clone of `Self` and puts it in a `Box`
     fn box_clone(&self) -> Box<dyn CompilerProxy<T>>;
@@ -883,11 +884,7 @@ where
                     Ok(Some(proxy)) => {
                         trace!("Found rustup proxy executable");
                         // take the pathbuf for rustc as resolved by the proxy
-                        match proxy
-                            .resolve_proxied_executable(creator1, cwd, &env2)
-                            .compat()
-                            .await
-                        {
+                        match proxy.resolve_proxied_executable(creator1, cwd, &env2).await {
                             Ok((resolved_path, _time)) => {
                                 trace!("Resolved path with rustup proxy {:?}", &resolved_path);
                                 Ok((Some(proxy), resolved_path))

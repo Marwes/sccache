@@ -886,7 +886,6 @@ where
             if let Some((compiler_proxy, _filetime)) = compiler_proxies_borrow.get(&path) {
                 compiler_proxy
                     .resolve_proxied_executable(self.creator.clone(), cwd.clone(), env.as_slice())
-                    .compat()
                     .await
                     .ok()
             } else {

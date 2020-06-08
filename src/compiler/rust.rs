@@ -505,16 +505,17 @@ where
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl<T> CompilerProxy<T> for RustupProxy
 where
     T: CommandCreatorSync,
 {
-    fn resolve_proxied_executable(
+    async fn resolve_proxied_executable(
         &self,
         mut creator: T,
         cwd: PathBuf,
         env: &[(OsString, OsString)],
-    ) -> SFuture<(PathBuf, FileTime)> {
+    ) -> Result<(PathBuf, FileTime)> {
         let proxy_executable = self.proxy_executable.clone();
 
         let mut child = creator.new_command_sync(&proxy_executable);
@@ -524,7 +525,7 @@ where
             .envs(ref_env(&env))
             .args(&["which", "rustc"]);
 
-        let lookup = run_input_output(child, None)
+        run_input_output(child, None)
             .map_err(|e| anyhow!("Failed to execute rustup which rustc: {}", e))
             .and_then(move |output| {
                 String::from_utf8(output.stdout.clone())
@@ -554,9 +555,9 @@ where
                             .map(|filetime| (proxied_compiler, filetime));
                         res
                     })
-            });
-
-        Box::new(lookup)
+            })
+            .compat()
+            .await
     }
 
     fn box_clone(&self) -> Box<dyn CompilerProxy<T>> {
