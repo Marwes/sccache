@@ -154,6 +154,7 @@ where
 
 /// An interface to a compiler for hash key generation, the result of
 /// argument parsing.
+#[async_trait::async_trait(?Send)]
 pub trait CompilerHasher<T>: fmt::Debug + Send + 'static
 where
     T: CommandCreatorSync,
@@ -177,7 +178,7 @@ where
     /// Look up a cached compile result in `storage`. If not found, run the
     /// compile and store the result.
     #[allow(clippy::too_many_arguments)]
-    fn get_cached_or_compile(
+    async fn get_cached_or_compile(
         self: Box<Self>,
         dist_client: Result<Option<Arc<dyn dist::Client>>>,
         creator: T,
@@ -187,7 +188,7 @@ where
         env_vars: Vec<(OsString, OsString)>,
         cache_control: CacheControl,
         pool: CpuPool,
-    ) -> SFuture<(CompileResult, process::Output)> {
+    ) -> Result<(CompileResult, process::Output)> {
         let out_pretty = self.output_pretty().into_owned();
         debug!("[{}]: get_cached_or_compile: {:?}", out_pretty, arguments);
         let start = Instant::now();
@@ -199,183 +200,169 @@ where
             Ok(Some(ref client)) => client.rewrite_includes_only(),
             _ => false,
         };
-        let result = self.generate_hash_key(
-            &creator,
-            cwd.clone(),
-            env_vars,
-            may_dist,
-            &pool,
-            rewrite_includes_only,
+        let result = self
+            .generate_hash_key(
+                &creator,
+                cwd.clone(),
+                env_vars,
+                may_dist,
+                &pool,
+                rewrite_includes_only,
+            )
+            .compat()
+            .await;
+        debug!(
+            "[{}]: generate_hash_key took {}",
+            out_pretty,
+            fmt_duration_as_secs(&start.elapsed())
         );
-        Box::new(result.then(move |res| -> SFuture<_> {
-            debug!(
-                "[{}]: generate_hash_key took {}",
-                out_pretty,
-                fmt_duration_as_secs(&start.elapsed())
-            );
-            let (key, compilation, weak_toolchain_key) = match res {
-                Err(e) => {
-                    return match e.downcast::<ProcessError>() {
-                        Ok(ProcessError(output)) => f_ok((CompileResult::Error, output)),
-                        Err(e) => f_err(e),
-                    };
-                }
-                Ok(HashResult {
-                    key,
-                    compilation,
-                    weak_toolchain_key,
-                }) => (key, compilation, weak_toolchain_key),
-            };
-            trace!("[{}]: Hash key: {}", out_pretty, key);
-            // If `ForceRecache` is enabled, we won't check the cache.
-            let start = Instant::now();
-            let cache_status = if cache_control == CacheControl::ForceRecache {
-                f_ok(Cache::Recache)
-            } else {
-                storage.get(&key)
-            };
-
+        let (key, compilation, weak_toolchain_key) = match result {
+            Err(e) => {
+                return match e.downcast::<ProcessError>() {
+                    Ok(ProcessError(output)) => Ok((CompileResult::Error, output)),
+                    Err(e) => Err(e),
+                };
+            }
+            Ok(HashResult {
+                key,
+                compilation,
+                weak_toolchain_key,
+            }) => (key, compilation, weak_toolchain_key),
+        };
+        trace!("[{}]: Hash key: {}", out_pretty, key);
+        // If `ForceRecache` is enabled, we won't check the cache.
+        let start = Instant::now();
+        let result = if cache_control == CacheControl::ForceRecache {
+            Ok(Cache::Recache)
+        } else {
             // Set a maximum time limit for the cache to respond before we forge
             // ahead ourselves with a compilation.
             let timeout = Duration::new(60, 0);
-            let cache_status = Timeout::new(cache_status, timeout);
+            Timeout::new(storage.get(&key), timeout).compat().await
+        };
 
-            // Check the result of the cache lookup.
-            Box::new(cache_status.then(move |result| {
-                let duration = start.elapsed();
-                let outputs = compilation
-                    .outputs()
-                    .map(|(key, path)| (key.to_string(), cwd.join(path)))
-                    .collect::<HashMap<_, _>>();
+        // Check the result of the cache lookup.
+        let duration = start.elapsed();
+        let outputs = compilation
+            .outputs()
+            .map(|(key, path)| (key.to_string(), cwd.join(path)))
+            .collect::<HashMap<_, _>>();
 
-                let miss_type = match result {
-                    Ok(Cache::Hit(mut entry)) => {
-                        debug!(
-                            "[{}]: Cache hit in {}",
-                            out_pretty,
-                            fmt_duration_as_secs(&duration)
-                        );
-                        let stdout = entry.get_stdout();
-                        let stderr = entry.get_stderr();
-                        let write = entry.extract_objects(outputs, &pool);
-                        let output = process::Output {
-                            status: exit_status(0),
-                            stdout,
-                            stderr,
-                        };
-                        let result = CompileResult::CacheHit(duration);
-                        return Box::new(write.map(|_| (result, output))) as SFuture<_>;
-                    }
-                    Ok(Cache::Miss) => {
-                        debug!(
-                            "[{}]: Cache miss in {}",
-                            out_pretty,
-                            fmt_duration_as_secs(&duration)
-                        );
-                        MissType::Normal
-                    }
-                    Ok(Cache::Recache) => {
-                        debug!(
-                            "[{}]: Cache recache in {}",
-                            out_pretty,
-                            fmt_duration_as_secs(&duration)
-                        );
-                        MissType::ForcedRecache
-                    }
-                    Err(err) => {
-                        if err.is_elapsed() {
-                            debug!(
-                                "[{}]: Cache timed out {}",
-                                out_pretty,
-                                fmt_duration_as_secs(&duration)
-                            );
-                            MissType::TimedOut
-                        } else {
-                            error!("[{}]: Cache read error: {}", out_pretty, err);
-                            if err.is_inner() {
-                                let err = err.into_inner().unwrap();
-                                for e in err.chain().skip(1) {
-                                    error!("[{}] \t{}", out_pretty, e);
-                                }
-                            }
-                            MissType::CacheReadError
-                        }
-                    }
-                };
-
-                // Cache miss, so compile it.
-                let start = Instant::now();
-                let compile = dist_or_local_compile(
-                    dist_client,
-                    creator,
-                    cwd,
-                    compilation,
-                    weak_toolchain_key,
-                    out_pretty.clone(),
+        let miss_type = match result {
+            Ok(Cache::Hit(mut entry)) => {
+                debug!(
+                    "[{}]: Cache hit in {}",
+                    out_pretty,
+                    fmt_duration_as_secs(&duration)
                 );
-
-                Box::new(
-                    compile.and_then(move |(cacheable, dist_type, compiler_result)| {
-                        let duration = start.elapsed();
-                        if !compiler_result.status.success() {
-                            debug!(
-                                "[{}]: Compiled but failed, not storing in cache",
-                                out_pretty
-                            );
-                            return f_ok((CompileResult::CompileFailed, compiler_result))
-                                as SFuture<_>;
+                let stdout = entry.get_stdout();
+                let stderr = entry.get_stderr();
+                entry.extract_objects(outputs, &pool).compat().await?;
+                let output = process::Output {
+                    status: exit_status(0),
+                    stdout,
+                    stderr,
+                };
+                let result = CompileResult::CacheHit(duration);
+                return Ok((result, output));
+            }
+            Ok(Cache::Miss) => {
+                debug!(
+                    "[{}]: Cache miss in {}",
+                    out_pretty,
+                    fmt_duration_as_secs(&duration)
+                );
+                MissType::Normal
+            }
+            Ok(Cache::Recache) => {
+                debug!(
+                    "[{}]: Cache recache in {}",
+                    out_pretty,
+                    fmt_duration_as_secs(&duration)
+                );
+                MissType::ForcedRecache
+            }
+            Err(err) => {
+                if err.is_elapsed() {
+                    debug!(
+                        "[{}]: Cache timed out {}",
+                        out_pretty,
+                        fmt_duration_as_secs(&duration)
+                    );
+                    MissType::TimedOut
+                } else {
+                    error!("[{}]: Cache read error: {}", out_pretty, err);
+                    if err.is_inner() {
+                        let err = err.into_inner().unwrap();
+                        for e in err.chain().skip(1) {
+                            error!("[{}] \t{}", out_pretty, e);
                         }
-                        if cacheable != Cacheable::Yes {
-                            // Not cacheable
-                            debug!("[{}]: Compiled but not cacheable", out_pretty);
-                            return f_ok((CompileResult::NotCacheable, compiler_result));
-                        }
-                        debug!(
-                            "[{}]: Compiled in {}, storing in cache",
-                            out_pretty,
-                            fmt_duration_as_secs(&duration)
-                        );
-                        let write = CacheWrite::from_objects(outputs, &pool);
-                        let write = write.fcontext("failed to zip up compiler outputs");
-                        let o = out_pretty.clone();
-                        Box::new(
-                            write
-                                .and_then(move |mut entry| {
-                                    entry.put_stdout(&compiler_result.stdout)?;
-                                    entry.put_stderr(&compiler_result.stderr)?;
+                    }
+                    MissType::CacheReadError
+                }
+            }
+        };
 
-                                    // Try to finish storing the newly-written cache
-                                    // entry. We'll get the result back elsewhere.
-                                    let future = storage.put(&key, entry).then(move |res| {
-                                        match res {
-                                            Ok(_) => debug!(
-                                                "[{}]: Stored in cache successfully!",
-                                                out_pretty
-                                            ),
-                                            Err(ref e) => debug!(
-                                                "[{}]: Cache write error: {:?}",
-                                                out_pretty, e
-                                            ),
-                                        }
-                                        res.map(|duration| CacheWriteInfo {
-                                            object_file_pretty: out_pretty,
-                                            duration,
-                                        })
-                                    });
-                                    let future = Box::new(future);
-                                    Ok((
-                                        CompileResult::CacheMiss(
-                                            miss_type, dist_type, duration, future,
-                                        ),
-                                        compiler_result,
-                                    ))
-                                })
-                                .fwith_context(move || format!("failed to store `{}` to cache", o)),
-                        )
-                    }),
-                )
-            }))
-        }))
+        // Cache miss, so compile it.
+        let start = Instant::now();
+        let (cacheable, dist_type, compiler_result) = dist_or_local_compile(
+            dist_client,
+            creator,
+            cwd,
+            compilation,
+            weak_toolchain_key,
+            out_pretty.clone(),
+        )
+        .compat()
+        .await?;
+
+        let duration = start.elapsed();
+        if !compiler_result.status.success() {
+            debug!(
+                "[{}]: Compiled but failed, not storing in cache",
+                out_pretty
+            );
+            return Ok((CompileResult::CompileFailed, compiler_result));
+        }
+        if cacheable != Cacheable::Yes {
+            // Not cacheable
+            debug!("[{}]: Compiled but not cacheable", out_pretty);
+            return Ok((CompileResult::NotCacheable, compiler_result));
+        }
+        debug!(
+            "[{}]: Compiled in {}, storing in cache",
+            out_pretty,
+            fmt_duration_as_secs(&duration)
+        );
+        let mut entry = CacheWrite::from_objects(outputs, &pool)
+            .compat()
+            .await
+            .context("failed to zip up compiler outputs")?;
+        let o = out_pretty.clone();
+        entry
+            .put_stdout(&compiler_result.stdout)
+            .with_context(|| format!("failed to store `{}` to cache", o))?;
+        entry
+            .put_stderr(&compiler_result.stderr)
+            .with_context(|| format!("failed to store `{}` to cache", o))?;
+
+        // Try to finish storing the newly-written cache
+        // entry. We'll get the result back elsewhere.
+        let future = storage.put(&key, entry).then(move |res| {
+            match res {
+                Ok(_) => debug!("[{}]: Stored in cache successfully!", out_pretty),
+                Err(ref e) => debug!("[{}]: Cache write error: {:?}", out_pretty, e),
+            }
+            res.map(|duration| CacheWriteInfo {
+                object_file_pretty: out_pretty,
+                duration,
+            })
+        });
+        let future = Box::new(future);
+        Ok((
+            CompileResult::CacheMiss(miss_type, dist_type, duration, future),
+            compiler_result,
+        ))
     }
 
     /// A descriptive string about the file that we're going to be producing.
@@ -1087,7 +1074,7 @@ mod test {
     use crate::mock_command::*;
     use crate::test::mock_storage::MockStorage;
     use crate::test::utils::*;
-    use futures::{future, Future};
+    use futures::Future;
     use futures_cpupool::CpuPool;
     use std::fs::{self, File};
     use std::io::Write;
@@ -1331,18 +1318,16 @@ LLVM version: 6.0",
         };
         let hasher2 = hasher.clone();
         let (cached, res) = runtime
-            .block_on(future::lazy(|| {
-                hasher.get_cached_or_compile(
-                    Ok(None),
-                    creator.clone(),
-                    storage.clone(),
-                    arguments.clone(),
-                    cwd.to_path_buf(),
-                    vec![],
-                    CacheControl::Default,
-                    pool.clone(),
-                )
-            }))
+            .block_on_std(hasher.get_cached_or_compile(
+                Ok(None),
+                creator.clone(),
+                storage.clone(),
+                arguments.clone(),
+                cwd.to_path_buf(),
+                vec![],
+                CacheControl::Default,
+                pool.clone(),
+            ))
             .unwrap();
         // Ensure that the object file was created.
         assert_eq!(
@@ -1368,18 +1353,16 @@ LLVM version: 6.0",
         );
         // There should be no actual compiler invocation.
         let (cached, res) = runtime
-            .block_on(future::lazy(|| {
-                hasher2.get_cached_or_compile(
-                    Ok(None),
-                    creator,
-                    storage,
-                    arguments,
-                    cwd.to_path_buf(),
-                    vec![],
-                    CacheControl::Default,
-                    pool,
-                )
-            }))
+            .block_on_std(hasher2.get_cached_or_compile(
+                Ok(None),
+                creator,
+                storage,
+                arguments,
+                cwd.to_path_buf(),
+                vec![],
+                CacheControl::Default,
+                pool,
+            ))
             .unwrap();
         // Ensure that the object file was created.
         assert_eq!(
@@ -1438,18 +1421,16 @@ LLVM version: 6.0",
         };
         let hasher2 = hasher.clone();
         let (cached, res) = runtime
-            .block_on(future::lazy(|| {
-                hasher.get_cached_or_compile(
-                    Ok(dist_client.clone()),
-                    creator.clone(),
-                    storage.clone(),
-                    arguments.clone(),
-                    cwd.to_path_buf(),
-                    vec![],
-                    CacheControl::Default,
-                    pool.clone(),
-                )
-            }))
+            .block_on_std(hasher.get_cached_or_compile(
+                Ok(dist_client.clone()),
+                creator.clone(),
+                storage.clone(),
+                arguments.clone(),
+                cwd.to_path_buf(),
+                vec![],
+                CacheControl::Default,
+                pool.clone(),
+            ))
             .unwrap();
         // Ensure that the object file was created.
         assert_eq!(
@@ -1475,18 +1456,16 @@ LLVM version: 6.0",
         );
         // There should be no actual compiler invocation.
         let (cached, res) = runtime
-            .block_on(future::lazy(|| {
-                hasher2.get_cached_or_compile(
-                    Ok(dist_client.clone()),
-                    creator,
-                    storage,
-                    arguments,
-                    cwd.to_path_buf(),
-                    vec![],
-                    CacheControl::Default,
-                    pool,
-                )
-            }))
+            .block_on_std(hasher2.get_cached_or_compile(
+                Ok(dist_client.clone()),
+                creator,
+                storage,
+                arguments,
+                cwd.to_path_buf(),
+                vec![],
+                CacheControl::Default,
+                pool,
+            ))
             .unwrap();
         // Ensure that the object file was created.
         assert_eq!(
@@ -1552,18 +1531,16 @@ LLVM version: 6.0",
         // The cache will return an error.
         storage.next_get(f_err(anyhow!("Some Error")));
         let (cached, res) = runtime
-            .block_on(future::lazy(|| {
-                hasher.get_cached_or_compile(
-                    Ok(None),
-                    creator,
-                    storage,
-                    arguments.clone(),
-                    cwd.to_path_buf(),
-                    vec![],
-                    CacheControl::Default,
-                    pool,
-                )
-            }))
+            .block_on_std(hasher.get_cached_or_compile(
+                Ok(None),
+                creator,
+                storage,
+                arguments.clone(),
+                cwd.to_path_buf(),
+                vec![],
+                CacheControl::Default,
+                pool,
+            ))
             .unwrap();
         // Ensure that the object file was created.
         assert_eq!(
@@ -1637,18 +1614,16 @@ LLVM version: 6.0",
         };
         let hasher2 = hasher.clone();
         let (cached, res) = runtime
-            .block_on(future::lazy(|| {
-                hasher.get_cached_or_compile(
-                    Ok(None),
-                    creator.clone(),
-                    storage.clone(),
-                    arguments.clone(),
-                    cwd.to_path_buf(),
-                    vec![],
-                    CacheControl::Default,
-                    pool.clone(),
-                )
-            }))
+            .block_on_std(hasher.get_cached_or_compile(
+                Ok(None),
+                creator.clone(),
+                storage.clone(),
+                arguments.clone(),
+                cwd.to_path_buf(),
+                vec![],
+                CacheControl::Default,
+                pool.clone(),
+            ))
             .unwrap();
         // Ensure that the object file was created.
         assert_eq!(
@@ -1745,18 +1720,16 @@ LLVM version: 6.0",
             o => panic!("Bad result from parse_arguments: {:?}", o),
         };
         let (cached, res) = runtime
-            .block_on(future::lazy(|| {
-                hasher.get_cached_or_compile(
-                    Ok(None),
-                    creator,
-                    storage,
-                    arguments,
-                    cwd.to_path_buf(),
-                    vec![],
-                    CacheControl::Default,
-                    pool,
-                )
-            }))
+            .block_on_std(hasher.get_cached_or_compile(
+                Ok(None),
+                creator,
+                storage,
+                arguments,
+                cwd.to_path_buf(),
+                vec![],
+                CacheControl::Default,
+                pool,
+            ))
             .unwrap();
         assert_eq!(cached, CompileResult::Error);
         assert_eq!(exit_status(1), res.status);
