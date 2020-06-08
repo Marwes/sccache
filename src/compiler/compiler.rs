@@ -805,11 +805,11 @@ pub enum CacheControl {
 ///
 /// Note that when the `TempDir` is dropped it will delete all of its contents
 /// including the path returned.
-pub fn write_temp_file(
+pub async fn write_temp_file(
     pool: &CpuPool,
     path: &Path,
     contents: Vec<u8>,
-) -> SFuture<(TempDir, PathBuf)> {
+) -> Result<(TempDir, PathBuf)> {
     let path = path.to_owned();
     pool.spawn_fn(move || -> Result<_> {
         let dir = tempfile::Builder::new().prefix("sccache").tempdir()?;
@@ -819,6 +819,8 @@ pub fn write_temp_file(
         Ok((dir, src))
     })
     .fcontext("failed to write temporary file")
+    .compat()
+    .await
 }
 
 /// If `executable` is a known compiler, return `Some(Box<Compiler>)`.
@@ -977,9 +979,7 @@ diab
 #endif
 "
     .to_vec();
-    let (tempdir, src) = write_temp_file(&pool, "testfile.c".as_ref(), test)
-        .compat()
-        .await?;
+    let (tempdir, src) = write_temp_file(&pool, "testfile.c".as_ref(), test).await?;
 
     let mut cmd = creator.clone().new_command_sync(&executable);
     cmd.stdout(Stdio::piped())
@@ -1012,23 +1012,23 @@ diab
             "clang" => {
                 debug!("Found clang");
                 return CCompiler::new(Clang, executable, &pool)
-                    .map(|c| Box::new(c) as Box<dyn Compiler<T>>)
                     .compat()
-                    .await;
+                    .await
+                    .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
             }
             "diab" => {
                 debug!("Found diab");
                 return CCompiler::new(Diab, executable, &pool)
-                    .map(|c| Box::new(c) as Box<dyn Compiler<T>>)
                     .compat()
-                    .await;
+                    .await
+                    .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
             }
             "gcc" => {
                 debug!("Found GCC");
                 return CCompiler::new(GCC, executable, &pool)
-                    .map(|c| Box::new(c) as Box<dyn Compiler<T>>)
                     .compat()
-                    .await;
+                    .await
+                    .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
             }
             "msvc" | "msvc-clang" => {
                 let is_clang = line == "msvc-clang";
@@ -1039,29 +1039,27 @@ diab
                     is_clang,
                     env,
                     &pool,
-                );
-                return prefix
-                    .and_then(move |prefix| {
-                        trace!("showIncludes prefix: '{}'", prefix);
-                        CCompiler::new(
-                            MSVC {
-                                includes_prefix: prefix,
-                                is_clang,
-                            },
-                            executable,
-                            &pool,
-                        )
-                        .map(|c| Box::new(c) as Box<dyn Compiler<T>>)
-                    })
-                    .compat()
-                    .await;
+                )
+                .await?;
+                trace!("showIncludes prefix: '{}'", prefix);
+                return CCompiler::new(
+                    MSVC {
+                        includes_prefix: prefix,
+                        is_clang,
+                    },
+                    executable,
+                    &pool,
+                )
+                .compat()
+                .await
+                .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
             }
             "nvcc" => {
                 debug!("Found NVCC");
                 return CCompiler::new(NVCC, executable, &pool)
-                    .map(|c| Box::new(c) as Box<dyn Compiler<T>>)
                     .compat()
-                    .await;
+                    .await
+                    .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
             }
             _ => (),
         }
@@ -1099,7 +1097,6 @@ mod test {
     use crate::mock_command::*;
     use crate::test::mock_storage::MockStorage;
     use crate::test::utils::*;
-    use crate::util::FutureWait;
     use futures::{future, Future};
     use futures_cpupool::CpuPool;
     use std::fs::{self, File};

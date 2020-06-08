@@ -21,6 +21,7 @@ use crate::dist;
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::run_input_output;
 use futures::future::Future;
+use futures_03::compat::*;
 use futures_cpupool::CpuPool;
 use local_encoding::{Encoder, Encoding};
 use log::Level::Debug;
@@ -97,94 +98,88 @@ fn from_local_codepage(bytes: &[u8]) -> io::Result<String> {
 }
 
 /// Detect the prefix included in the output of MSVC's -showIncludes output.
-pub fn detect_showincludes_prefix<T>(
+pub async fn detect_showincludes_prefix<T>(
     creator: &T,
     exe: &OsStr,
     is_clang: bool,
     env: Vec<(OsString, OsString)>,
     pool: &CpuPool,
-) -> SFuture<String>
+) -> Result<String>
 where
     T: CommandCreatorSync,
 {
-    let write = write_temp_file(pool, "test.c".as_ref(), b"#include \"test.h\"\n".to_vec());
+    let (tempdir, input) =
+        write_temp_file(pool, "test.c".as_ref(), b"#include \"test.h\"\n".to_vec()).await?;
 
     let exe = exe.to_os_string();
     let mut creator = creator.clone();
     let pool = pool.clone();
-    let write2 = write.and_then(move |(tempdir, input)| {
-        let header = tempdir.path().join("test.h");
-        pool.spawn_fn(move || -> Result<_> {
-            let mut file = File::create(&header)?;
-            file.write_all(b"/* empty */\n")?;
-            Ok((tempdir, input))
-        })
-        .fcontext("failed to write temporary file")
-    });
-    let output = write2.and_then(move |(tempdir, input)| {
-        let mut cmd = creator.new_command_sync(&exe);
-        // clang.exe on Windows reports the same set of built-in preprocessor defines as clang-cl,
-        // but it doesn't accept MSVC commandline arguments unless you pass --driver-mode=cl.
-        // clang-cl.exe will accept this argument as well, so always add it in this case.
-        if is_clang {
-            cmd.arg("--driver-mode=cl");
-        }
-        cmd.args(&["-nologo", "-showIncludes", "-c", "-Fonul", "-I."])
-            .arg(&input)
-            .current_dir(&tempdir.path())
-            // The MSDN docs say the -showIncludes output goes to stderr,
-            // but that's not true unless running with -E.
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        trace!("detect_showincludes_prefix: {:?}", cmd);
 
-        run_input_output(cmd, None).map(|e| {
-            // Keep the tempdir around so test.h still exists for the
-            // checks below.
-            (e, tempdir)
-        })
-    });
+    let header = tempdir.path().join("test.h");
+    pool.spawn_fn(move || -> Result<_> {
+        let mut file = File::create(&header)?;
+        file.write_all(b"/* empty */\n")?;
+        Ok(())
+    })
+    .fcontext("failed to write temporary file")
+    .compat()
+    .await?;
 
-    Box::new(output.and_then(|(output, tempdir)| {
-        if !output.status.success() {
-            bail!("Failed to detect showIncludes prefix")
+    let mut cmd = creator.new_command_sync(&exe);
+    // clang.exe on Windows reports the same set of built-in preprocessor defines as clang-cl,
+    // but it doesn't accept MSVC commandline arguments unless you pass --driver-mode=cl.
+    // clang-cl.exe will accept this argument as well, so always add it in this case.
+    if is_clang {
+        cmd.arg("--driver-mode=cl");
+    }
+    cmd.args(&["-nologo", "-showIncludes", "-c", "-Fonul", "-I."])
+        .arg(&input)
+        .current_dir(&tempdir.path())
+        // The MSDN docs say the -showIncludes output goes to stderr,
+        // but that's not true unless running with -E.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    trace!("detect_showincludes_prefix: {:?}", cmd);
+
+    let output = run_input_output(cmd, None).compat().await?;
+    if !output.status.success() {
+        bail!("Failed to detect showIncludes prefix")
+    }
+
+    let process::Output {
+        stdout: stdout_bytes,
+        ..
+    } = output;
+    let stdout = from_local_codepage(&stdout_bytes)
+        .context("Failed to convert compiler stdout while detecting showIncludes prefix")?;
+    for line in stdout.lines() {
+        if !line.ends_with("test.h") {
+            continue;
         }
-
-        let process::Output {
-            stdout: stdout_bytes,
-            ..
-        } = output;
-        let stdout = from_local_codepage(&stdout_bytes)
-            .context("Failed to convert compiler stdout while detecting showIncludes prefix")?;
-        for line in stdout.lines() {
-            if !line.ends_with("test.h") {
+        for (i, c) in line.char_indices().rev() {
+            if c != ' ' {
                 continue;
             }
-            for (i, c) in line.char_indices().rev() {
-                if c != ' ' {
-                    continue;
-                }
-                let path = tempdir.path().join(&line[i + 1..]);
-                // See if the rest of this line is a full pathname.
-                if path.exists() {
-                    // Everything from the beginning of the line
-                    // to this index is the prefix.
-                    return Ok(line[..=i].to_owned());
-                }
+            let path = tempdir.path().join(&line[i + 1..]);
+            // See if the rest of this line is a full pathname.
+            if path.exists() {
+                // Everything from the beginning of the line
+                // to this index is the prefix.
+                return Ok(line[..=i].to_owned());
             }
         }
-        drop(tempdir);
+    }
+    drop(tempdir);
 
-        debug!(
-            "failed to detect showIncludes prefix with output: {}",
-            stdout
-        );
+    debug!(
+        "failed to detect showIncludes prefix with output: {}",
+        stdout
+    );
 
-        bail!("Failed to detect showIncludes prefix")
-    }))
+    bail!("Failed to detect showIncludes prefix")
 }
 
 #[cfg(unix)]

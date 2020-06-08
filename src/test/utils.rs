@@ -227,6 +227,21 @@ impl TestFixture {
     }
 }
 
+pub trait FutureWait: std::future::Future {
+    fn wait(self) -> Self::Output;
+}
+
+impl<F> FutureWait for F
+where
+    F: std::future::Future,
+{
+    fn wait(self) -> Self::Output {
+        tokio_compat::runtime::Runtime::new()
+            .unwrap()
+            .block_on_std(self)
+    }
+}
+
 #[test]
 fn test_map_contains_ok() {
     let mut m = HashMap::new();
