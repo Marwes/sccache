@@ -162,7 +162,7 @@ where
     /// Given information about a compiler command, generate a hash key
     /// that can be used for cache lookups, as well as any additional
     /// information that can be reused for compilation if necessary.
-    fn generate_hash_key(
+    async fn generate_hash_key(
         self: Box<Self>,
         creator: &T,
         cwd: PathBuf,
@@ -170,7 +170,7 @@ where
         may_dist: bool,
         pool: &CpuPool,
         rewrite_includes_only: bool,
-    ) -> SFuture<HashResult>;
+    ) -> Result<HashResult>;
 
     /// Return the state of any `--color` option passed to the compiler.
     fn color_mode(&self) -> ColorMode;
@@ -209,7 +209,6 @@ where
                 &pool,
                 rewrite_includes_only,
             )
-            .compat()
             .await;
         debug!(
             "[{}]: generate_hash_key took {}",

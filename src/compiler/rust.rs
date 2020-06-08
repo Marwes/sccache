@@ -1227,11 +1227,12 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     })
 }
 
+#[async_trait::async_trait(?Send)]
 impl<T> CompilerHasher<T> for RustHasher
 where
     T: CommandCreatorSync,
 {
-    fn generate_hash_key(
+    async fn generate_hash_key(
         self: Box<Self>,
         creator: &T,
         cwd: PathBuf,
@@ -1239,7 +1240,7 @@ where
         _may_dist: bool,
         pool: &CpuPool,
         _rewrite_includes_only: bool,
-    ) -> SFuture<HashResult> {
+    ) -> Result<HashResult> {
         let me = *self;
         #[rustfmt::skip] // https://github.com/rust-lang/rustfmt/issues/3759
         let RustHasher {
@@ -1314,195 +1315,193 @@ where
         let abs_staticlibs = staticlibs.iter().map(|s| cwd.join(s)).collect::<Vec<_>>();
         let staticlib_hashes = hash_all(&abs_staticlibs, pool);
         let creator = creator.clone();
-        let hashes = source_files_and_hashes.join3(extern_hashes, staticlib_hashes);
-        Box::new(hashes.and_then(
-            move |((source_files, source_hashes), extern_hashes, staticlib_hashes)| -> SFuture<_> {
-                // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
-                let mut m = Digest::new();
-                // Hash inputs:
-                // 1. A version
-                m.update(CACHE_VERSION);
-                // 2. compiler_shlibs_digests
-                for d in compiler_shlibs_digests {
-                    m.update(d.as_bytes());
+        let ((source_files, source_hashes), extern_hashes, staticlib_hashes) =
+            source_files_and_hashes
+                .join3(extern_hashes, staticlib_hashes)
+                .compat()
+                .await?;
+
+        // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
+        let mut m = Digest::new();
+        // Hash inputs:
+        // 1. A version
+        m.update(CACHE_VERSION);
+        // 2. compiler_shlibs_digests
+        for d in compiler_shlibs_digests {
+            m.update(d.as_bytes());
+        }
+        let weak_toolchain_key = m.clone().finish();
+        // 3. The full commandline (self.arguments)
+        // TODO: there will be full paths here, it would be nice to
+        // normalize them so we can get cross-machine cache hits.
+        // A few argument types are not passed in a deterministic order
+        // by cargo: --extern, -L, --cfg. We'll filter those out, sort them,
+        // and append them to the rest of the arguments.
+        let args = {
+            let (mut sortables, rest): (Vec<_>, Vec<_>) = os_string_arguments
+                .iter()
+                // We exclude a few arguments from the hash:
+                //   -L, --extern, --out-dir
+                // These contain paths which aren't relevant to the output, and the compiler inputs
+                // in those paths (rlibs and static libs used in the compilation) are used as hash
+                // inputs below.
+                .filter(|&&(ref arg, _)| !(arg == "--extern" || arg == "-L" || arg == "--out-dir"))
+                // A few argument types were not passed in a deterministic order
+                // by older versions of cargo: --extern, -L, --cfg. We'll filter the rest of those
+                // out, sort them, and append them to the rest of the arguments.
+                .partition(|&&(ref arg, _)| arg == "--cfg");
+            sortables.sort();
+            rest.into_iter()
+                .chain(sortables)
+                .flat_map(|&(ref arg, ref val)| iter::once(arg).chain(val.as_ref()))
+                .fold(OsString::new(), |mut a, b| {
+                    a.push(b);
+                    a
+                })
+        };
+        args.hash(&mut HashToDigest { digest: &mut m });
+        // 4. The digest of all source files (this includes src file from cmdline).
+        // 5. The digest of all files listed on the commandline (self.externs).
+        // 6. The digest of all static libraries listed on the commandline (self.staticlibs).
+        for h in source_hashes
+            .into_iter()
+            .chain(extern_hashes)
+            .chain(staticlib_hashes)
+        {
+            m.update(h.as_bytes());
+        }
+        // 7. Environment variables. Ideally we'd use anything referenced
+        // via env! in the program, but we don't have a way to determine that
+        // currently, and hashing all environment variables is too much, so
+        // we'll just hash the CARGO_ env vars and hope that's sufficient.
+        // Upstream Rust issue tracking getting information about env! usage:
+        // https://github.com/rust-lang/rust/issues/40364
+        let mut env_vars: Vec<_> = env_vars
+            .iter()
+            // Filter out RUSTC_COLOR since we control color usage with command line flags.
+            // rustc reports an error when both are present.
+            .filter(|(ref k, _)| k != "RUSTC_COLOR")
+            .cloned()
+            .collect();
+        env_vars.sort();
+        for &(ref var, ref val) in env_vars.iter() {
+            // CARGO_MAKEFLAGS will have jobserver info which is extremely non-cacheable.
+            if var.starts_with("CARGO_") && var != "CARGO_MAKEFLAGS" {
+                var.hash(&mut HashToDigest { digest: &mut m });
+                m.update(b"=");
+                val.hash(&mut HashToDigest { digest: &mut m });
+            }
+        }
+        // 8. The cwd of the compile. This will wind up in the rlib.
+        cwd.hash(&mut HashToDigest { digest: &mut m });
+        // Turn arguments into a simple Vec<OsString> to calculate outputs.
+        let flat_os_string_arguments: Vec<OsString> = os_string_arguments
+            .into_iter()
+            .flat_map(|(arg, val)| iter::once(arg).chain(val))
+            .collect();
+        let mut outputs = get_compiler_outputs(
+            &creator,
+            &executable,
+            flat_os_string_arguments,
+            &cwd,
+            &env_vars,
+        )
+        .compat()
+        .await?;
+
+        // metadata / dep-info don't ever generate binaries, but
+        // rustc still makes them appear in the --print
+        // file-names output (see
+        // https://github.com/rust-lang/rust/pull/68799).
+        //
+        // So if we see a binary in the rustc output and figure
+        // out that we're not _actually_ generating it, then we
+        // can avoid generating everything that isn't an rlib /
+        // rmeta.
+        //
+        // This can go away once the above rustc PR makes it in.
+        let emit_generates_only_metadata =
+            !emit.is_empty() && emit.iter().all(|e| e == "metadata" || e == "dep-info");
+
+        if emit_generates_only_metadata {
+            outputs.retain(|o| o.ends_with(".rlib") || o.ends_with(".rmeta"));
+        }
+
+        if emit.contains("metadata") {
+            // rustc currently does not report rmeta outputs with --print file-names
+            // --emit metadata the rlib is printed, and with --emit metadata,link
+            // only the rlib is printed.
+            let rlibs: HashSet<_> = outputs
+                .iter()
+                .cloned()
+                .filter(|p| p.ends_with(".rlib"))
+                .collect();
+            for lib in rlibs {
+                let rmeta = lib.replacen(".rlib", ".rmeta", 1);
+                // Do this defensively for future versions of rustc that may
+                // be fixed.
+                if !outputs.contains(&rmeta) {
+                    outputs.push(rmeta);
                 }
-                let weak_toolchain_key = m.clone().finish();
-                // 3. The full commandline (self.arguments)
-                // TODO: there will be full paths here, it would be nice to
-                // normalize them so we can get cross-machine cache hits.
-                // A few argument types are not passed in a deterministic order
-                // by cargo: --extern, -L, --cfg. We'll filter those out, sort them,
-                // and append them to the rest of the arguments.
-                let args = {
-                    let (mut sortables, rest): (Vec<_>, Vec<_>) = os_string_arguments
-                        .iter()
-                        // We exclude a few arguments from the hash:
-                        //   -L, --extern, --out-dir
-                        // These contain paths which aren't relevant to the output, and the compiler inputs
-                        // in those paths (rlibs and static libs used in the compilation) are used as hash
-                        // inputs below.
-                        .filter(|&&(ref arg, _)| {
-                            !(arg == "--extern" || arg == "-L" || arg == "--out-dir")
-                        })
-                        // A few argument types were not passed in a deterministic order
-                        // by older versions of cargo: --extern, -L, --cfg. We'll filter the rest of those
-                        // out, sort them, and append them to the rest of the arguments.
-                        .partition(|&&(ref arg, _)| arg == "--cfg");
-                    sortables.sort();
-                    rest.into_iter()
-                        .chain(sortables)
-                        .flat_map(|&(ref arg, ref val)| iter::once(arg).chain(val.as_ref()))
-                        .fold(OsString::new(), |mut a, b| {
-                            a.push(b);
-                            a
-                        })
-                };
-                args.hash(&mut HashToDigest { digest: &mut m });
-                // 4. The digest of all source files (this includes src file from cmdline).
-                // 5. The digest of all files listed on the commandline (self.externs).
-                // 6. The digest of all static libraries listed on the commandline (self.staticlibs).
-                for h in source_hashes
-                    .into_iter()
-                    .chain(extern_hashes)
-                    .chain(staticlib_hashes)
-                {
-                    m.update(h.as_bytes());
+                if !emit.contains("link") {
+                    outputs.retain(|p| *p != lib);
                 }
-                // 7. Environment variables. Ideally we'd use anything referenced
-                // via env! in the program, but we don't have a way to determine that
-                // currently, and hashing all environment variables is too much, so
-                // we'll just hash the CARGO_ env vars and hope that's sufficient.
-                // Upstream Rust issue tracking getting information about env! usage:
-                // https://github.com/rust-lang/rust/issues/40364
-                let mut env_vars: Vec<_> = env_vars
-                    .iter()
-                    // Filter out RUSTC_COLOR since we control color usage with command line flags.
-                    // rustc reports an error when both are present.
-                    .filter(|(ref k, _)| k != "RUSTC_COLOR")
-                    .cloned()
-                    .collect();
-                env_vars.sort();
-                for &(ref var, ref val) in env_vars.iter() {
-                    // CARGO_MAKEFLAGS will have jobserver info which is extremely non-cacheable.
-                    if var.starts_with("CARGO_") && var != "CARGO_MAKEFLAGS" {
-                        var.hash(&mut HashToDigest { digest: &mut m });
-                        m.update(b"=");
-                        val.hash(&mut HashToDigest { digest: &mut m });
-                    }
-                }
-                // 8. The cwd of the compile. This will wind up in the rlib.
-                cwd.hash(&mut HashToDigest { digest: &mut m });
-                // Turn arguments into a simple Vec<OsString> to calculate outputs.
-                let flat_os_string_arguments: Vec<OsString> = os_string_arguments
-                    .into_iter()
-                    .flat_map(|(arg, val)| iter::once(arg).chain(val))
-                    .collect();
-                Box::new(
-                    get_compiler_outputs(
-                        &creator,
-                        &executable,
-                        flat_os_string_arguments,
-                        &cwd,
-                        &env_vars,
-                    )
-                    .map(move |mut outputs| {
-                        // metadata / dep-info don't ever generate binaries, but
-                        // rustc still makes them appear in the --print
-                        // file-names output (see
-                        // https://github.com/rust-lang/rust/pull/68799).
-                        //
-                        // So if we see a binary in the rustc output and figure
-                        // out that we're not _actually_ generating it, then we
-                        // can avoid generating everything that isn't an rlib /
-                        // rmeta.
-                        //
-                        // This can go away once the above rustc PR makes it in.
-                        let emit_generates_only_metadata = !emit.is_empty()
-                            && emit.iter().all(|e| e == "metadata" || e == "dep-info");
+            }
+        }
 
-                        if emit_generates_only_metadata {
-                            outputs.retain(|o| o.ends_with(".rlib") || o.ends_with(".rmeta"));
-                        }
+        // Convert output files into a map of basename -> full
+        // path, and remove some unneeded / non-existing ones,
+        // see https://github.com/rust-lang/rust/pull/68799.
+        let mut outputs = outputs
+            .into_iter()
+            .map(|o| {
+                let p = output_dir.join(&o);
+                (o, p)
+            })
+            .collect::<HashMap<_, _>>();
+        let dep_info = if let Some(dep_info) = dep_info {
+            let p = output_dir.join(&dep_info);
+            outputs.insert(dep_info.to_string_lossy().into_owned(), p.clone());
+            Some(p)
+        } else {
+            None
+        };
+        let mut arguments = arguments;
+        // Request color output unless json was requested. The client will strip colors if needed.
+        if !has_json {
+            arguments.push(Argument::WithValue(
+                "--color",
+                ArgData::Color("always".into()),
+                ArgDisposition::Separated,
+            ));
+        }
 
-                        if emit.contains("metadata") {
-                            // rustc currently does not report rmeta outputs with --print file-names
-                            // --emit metadata the rlib is printed, and with --emit metadata,link
-                            // only the rlib is printed.
-                            let rlibs: HashSet<_> = outputs
-                                .iter()
-                                .cloned()
-                                .filter(|p| p.ends_with(".rlib"))
-                                .collect();
-                            for lib in rlibs {
-                                let rmeta = lib.replacen(".rlib", ".rmeta", 1);
-                                // Do this defensively for future versions of rustc that may
-                                // be fixed.
-                                if !outputs.contains(&rmeta) {
-                                    outputs.push(rmeta);
-                                }
-                                if !emit.contains("link") {
-                                    outputs.retain(|p| *p != lib);
-                                }
-                            }
-                        }
+        let inputs = source_files
+            .into_iter()
+            .chain(abs_externs)
+            .chain(abs_staticlibs)
+            .collect();
 
-                        // Convert output files into a map of basename -> full
-                        // path, and remove some unneeded / non-existing ones,
-                        // see https://github.com/rust-lang/rust/pull/68799.
-                        let mut outputs = outputs
-                            .into_iter()
-                            .map(|o| {
-                                let p = output_dir.join(&o);
-                                (o, p)
-                            })
-                            .collect::<HashMap<_, _>>();
-                        let dep_info = if let Some(dep_info) = dep_info {
-                            let p = output_dir.join(&dep_info);
-                            outputs.insert(dep_info.to_string_lossy().into_owned(), p.clone());
-                            Some(p)
-                        } else {
-                            None
-                        };
-                        let mut arguments = arguments;
-                        // Request color output unless json was requested. The client will strip colors if needed.
-                        if !has_json {
-                            arguments.push(Argument::WithValue(
-                                "--color",
-                                ArgData::Color("always".into()),
-                                ArgDisposition::Separated,
-                            ));
-                        }
-
-                        let inputs = source_files
-                            .into_iter()
-                            .chain(abs_externs)
-                            .chain(abs_staticlibs)
-                            .collect();
-
-                        HashResult {
-                            key: m.finish(),
-                            compilation: Box::new(RustCompilation {
-                                executable,
-                                host,
-                                sysroot,
-                                arguments,
-                                inputs,
-                                outputs,
-                                crate_link_paths,
-                                crate_name,
-                                crate_types,
-                                dep_info,
-                                cwd,
-                                env_vars,
-                                #[cfg(feature = "dist-client")]
-                                rlib_dep_reader,
-                            }),
-                            weak_toolchain_key,
-                        }
-                    }),
-                )
-            },
-        ))
+        Ok(HashResult {
+            key: m.finish(),
+            compilation: Box::new(RustCompilation {
+                executable,
+                host,
+                sysroot,
+                arguments,
+                inputs,
+                outputs,
+                crate_link_paths,
+                crate_name,
+                crate_types,
+                dep_info,
+                cwd,
+                env_vars,
+                #[cfg(feature = "dist-client")]
+                rlib_dep_reader,
+            }),
+            weak_toolchain_key,
+        })
     }
 
     fn color_mode(&self) -> ColorMode {

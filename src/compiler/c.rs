@@ -251,12 +251,13 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl<T, I> CompilerHasher<T> for CCompilerHasher<I>
 where
     T: CommandCreatorSync,
     I: CCompilerImpl,
 {
-    fn generate_hash_key(
+    async fn generate_hash_key(
         self: Box<Self>,
         creator: &T,
         cwd: PathBuf,
@@ -264,7 +265,7 @@ where
         may_dist: bool,
         pool: &CpuPool,
         rewrite_includes_only: bool,
-    ) -> SFuture<HashResult> {
+    ) -> Result<HashResult> {
         let me = *self;
         let CCompilerHasher {
             parsed_args,
@@ -369,6 +370,8 @@ where
                     }))
                 }),
         )
+        .compat()
+        .await
     }
 
     fn color_mode(&self) -> ColorMode {
