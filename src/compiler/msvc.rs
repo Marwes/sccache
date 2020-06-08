@@ -21,7 +21,6 @@ use crate::dist;
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::run_input_output;
 use futures::compat::*;
-use futures_01::future::Future;
 use futures_cpupool::CpuPool;
 use local_encoding::{Encoder, Encoding};
 use log::Level::Debug;
@@ -44,6 +43,7 @@ pub struct MSVC {
     pub is_clang: bool,
 }
 
+#[async_trait::async_trait(?Send)]
 impl CCompilerImpl for MSVC {
     fn kind(&self) -> CCompilerKind {
         CCompilerKind::MSVC
@@ -56,7 +56,7 @@ impl CCompilerImpl for MSVC {
         parse_arguments(arguments, cwd, self.is_clang)
     }
 
-    fn preprocess<T>(
+    async fn preprocess<T>(
         &self,
         creator: &T,
         executable: &Path,
@@ -65,7 +65,7 @@ impl CCompilerImpl for MSVC {
         env_vars: &[(OsString, OsString)],
         may_dist: bool,
         _rewrite_includes_only: bool,
-    ) -> SFuture<process::Output>
+    ) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
@@ -78,6 +78,7 @@ impl CCompilerImpl for MSVC {
             may_dist,
             &self.includes_prefix,
         )
+        .await
     }
 
     fn generate_compile_commands(
@@ -643,7 +644,7 @@ fn normpath(path: &str) -> String {
     path.to_owned()
 }
 
-pub fn preprocess<T>(
+pub async fn preprocess<T>(
     creator: &T,
     executable: &Path,
     parsed_args: &ParsedArguments,
@@ -651,7 +652,7 @@ pub fn preprocess<T>(
     env_vars: &[(OsString, OsString)],
     _may_dist: bool,
     includes_prefix: &str,
-) -> SFuture<process::Output>
+) -> Result<process::Output>
 where
     T: CommandCreatorSync,
 {
@@ -677,65 +678,65 @@ where
     let includes_prefix = includes_prefix.to_string();
     let cwd = cwd.to_owned();
 
-    Box::new(run_input_output(cmd, None).and_then(move |output| {
-        let parsed_args = &parsed_args;
-        if let (Some(ref objfile), &Some(ref depfile)) =
-            (parsed_args.outputs.get("obj"), &parsed_args.depfile)
-        {
-            let f = File::create(cwd.join(depfile))?;
-            let mut f = BufWriter::new(f);
+    let output = run_input_output(cmd, None).compat().await?;
 
-            encode_path(&mut f, &objfile)
-                .with_context(|| format!("Couldn't encode objfile filename: '{:?}'", objfile))?;
-            write!(f, ": ")?;
-            encode_path(&mut f, &parsed_args.input)
-                .with_context(|| format!("Couldn't encode input filename: '{:?}'", objfile))?;
-            write!(f, " ")?;
-            let process::Output {
-                status,
-                stdout,
-                stderr: stderr_bytes,
-            } = output;
-            let stderr = from_local_codepage(&stderr_bytes)
-                .context("Failed to convert preprocessor stderr")?;
-            let mut deps = HashSet::new();
-            let mut stderr_bytes = vec![];
-            for line in stderr.lines() {
-                if line.starts_with(&includes_prefix) {
-                    let dep = normpath(line[includes_prefix.len()..].trim());
-                    trace!("included: {}", dep);
-                    if deps.insert(dep.clone()) && !dep.contains(' ') {
-                        write!(f, "{} ", dep)?;
-                    }
-                    if !parsed_args.msvc_show_includes {
-                        continue;
-                    }
+    let parsed_args = &parsed_args;
+    if let (Some(ref objfile), &Some(ref depfile)) =
+        (parsed_args.outputs.get("obj"), &parsed_args.depfile)
+    {
+        let f = File::create(cwd.join(depfile))?;
+        let mut f = BufWriter::new(f);
+
+        encode_path(&mut f, &objfile)
+            .with_context(|| format!("Couldn't encode objfile filename: '{:?}'", objfile))?;
+        write!(f, ": ")?;
+        encode_path(&mut f, &parsed_args.input)
+            .with_context(|| format!("Couldn't encode input filename: '{:?}'", objfile))?;
+        write!(f, " ")?;
+        let process::Output {
+            status,
+            stdout,
+            stderr: stderr_bytes,
+        } = output;
+        let stderr =
+            from_local_codepage(&stderr_bytes).context("Failed to convert preprocessor stderr")?;
+        let mut deps = HashSet::new();
+        let mut stderr_bytes = vec![];
+        for line in stderr.lines() {
+            if line.starts_with(&includes_prefix) {
+                let dep = normpath(line[includes_prefix.len()..].trim());
+                trace!("included: {}", dep);
+                if deps.insert(dep.clone()) && !dep.contains(' ') {
+                    write!(f, "{} ", dep)?;
                 }
-                stderr_bytes.extend_from_slice(line.as_bytes());
-                stderr_bytes.push(b'\n');
-            }
-            writeln!(f)?;
-            // Write extra rules for each dependency to handle
-            // removed files.
-            encode_path(&mut f, &parsed_args.input)
-                .with_context(|| format!("Couldn't encode filename: '{:?}'", parsed_args.input))?;
-            writeln!(f, ":")?;
-            let mut sorted = deps.into_iter().collect::<Vec<_>>();
-            sorted.sort();
-            for dep in sorted {
-                if !dep.contains(' ') {
-                    writeln!(f, "{}:", dep)?;
+                if !parsed_args.msvc_show_includes {
+                    continue;
                 }
             }
-            Ok(process::Output {
-                status,
-                stdout,
-                stderr: stderr_bytes,
-            })
-        } else {
-            Ok(output)
+            stderr_bytes.extend_from_slice(line.as_bytes());
+            stderr_bytes.push(b'\n');
         }
-    }))
+        writeln!(f)?;
+        // Write extra rules for each dependency to handle
+        // removed files.
+        encode_path(&mut f, &parsed_args.input)
+            .with_context(|| format!("Couldn't encode filename: '{:?}'", parsed_args.input))?;
+        writeln!(f, ":")?;
+        let mut sorted = deps.into_iter().collect::<Vec<_>>();
+        sorted.sort();
+        for dep in sorted {
+            if !dep.contains(' ') {
+                writeln!(f, "{}:", dep)?;
+            }
+        }
+        Ok(process::Output {
+            status,
+            stdout,
+            stderr: stderr_bytes,
+        })
+    } else {
+        Ok(output)
+    }
 }
 
 fn generate_compile_commands(

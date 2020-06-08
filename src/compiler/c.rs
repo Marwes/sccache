@@ -23,7 +23,6 @@ use crate::dist;
 use crate::dist::pkg;
 use crate::mock_command::CommandCreatorSync;
 use crate::util::{hash_all, Digest, HashToDigest};
-use futures::{compat::*, prelude::*};
 use futures_cpupool::CpuPool;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -163,6 +162,7 @@ pub enum CCompilerKind {
 }
 
 /// An interface to a specific C compiler.
+#[async_trait::async_trait(?Send)]
 pub trait CCompilerImpl: Clone + fmt::Debug + Send + 'static {
     /// Return the kind of compiler.
     fn kind(&self) -> CCompilerKind;
@@ -174,7 +174,7 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + 'static {
     ) -> CompilerArguments<ParsedArguments>;
     /// Run the C preprocessor with the specified set of arguments.
     #[allow(clippy::too_many_arguments)]
-    fn preprocess<T>(
+    async fn preprocess<T>(
         &self,
         creator: &T,
         executable: &Path,
@@ -183,7 +183,7 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + 'static {
         env_vars: &[(OsString, OsString)],
         may_dist: bool,
         rewrite_includes_only: bool,
-    ) -> SFuture<process::Output>
+    ) -> Result<process::Output>
     where
         T: CommandCreatorSync;
     /// Generate a command that can be used to invoke the C compiler to perform
@@ -271,6 +271,9 @@ where
             executable_digest,
             compiler,
         } = me;
+
+        let out_pretty = parsed_args.output_pretty().into_owned();
+
         let result = compiler
             .preprocess(
                 creator,
@@ -281,18 +284,17 @@ where
                 may_dist,
                 rewrite_includes_only,
             )
-            .compat();
-        let out_pretty = parsed_args.output_pretty().into_owned();
-        let result = result.map_err(move |e| {
-            debug!("[{}]: preprocessor failed: {:?}", out_pretty, e);
-            e
-        });
+            .await
+            .map_err(move |e| {
+                debug!("[{}]: preprocessor failed: {:?}", out_pretty, e);
+                e
+            });
         let out_pretty = parsed_args.output_pretty().into_owned();
         let extra_hashes = hash_all(&parsed_args.extra_hash_files, &pool);
         let outputs = parsed_args.outputs.clone();
         let args_cwd = cwd.clone();
 
-        let preprocessor_result = result.await.or_else(move |err| {
+        let preprocessor_result = result.or_else(move |err| {
             // Errors remove all traces of potential output.
             debug!("removing files {:?}", &outputs);
 

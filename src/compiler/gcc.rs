@@ -18,6 +18,7 @@ use crate::compiler::{clang, Cacheable, ColorMode, CompileCommand, CompilerArgum
 use crate::dist;
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{run_input_output, OsStrExt};
+use futures::compat::*;
 use log::Level::Trace;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -32,6 +33,7 @@ use crate::errors::*;
 #[derive(Clone, Debug)]
 pub struct GCC;
 
+#[async_trait::async_trait(?Send)]
 impl CCompilerImpl for GCC {
     fn kind(&self) -> CCompilerKind {
         CCompilerKind::GCC
@@ -44,7 +46,7 @@ impl CCompilerImpl for GCC {
         parse_arguments(arguments, cwd, &ARGS[..])
     }
 
-    fn preprocess<T>(
+    async fn preprocess<T>(
         &self,
         creator: &T,
         executable: &Path,
@@ -53,7 +55,7 @@ impl CCompilerImpl for GCC {
         env_vars: &[(OsString, OsString)],
         may_dist: bool,
         rewrite_includes_only: bool,
-    ) -> SFuture<process::Output>
+    ) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
@@ -67,6 +69,7 @@ impl CCompilerImpl for GCC {
             self.kind(),
             rewrite_includes_only,
         )
+        .await
     }
 
     fn generate_compile_commands(
@@ -466,7 +469,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn preprocess<T>(
+pub async fn preprocess<T>(
     creator: &T,
     executable: &Path,
     parsed_args: &ParsedArguments,
@@ -475,7 +478,7 @@ pub fn preprocess<T>(
     may_dist: bool,
     kind: CCompilerKind,
     rewrite_includes_only: bool,
-) -> SFuture<process::Output>
+) -> Result<process::Output>
 where
     T: CommandCreatorSync,
 {
@@ -518,7 +521,7 @@ where
     if log_enabled!(Trace) {
         trace!("preprocess: {:?}", cmd);
     }
-    Box::new(run_input_output(cmd, None))
+    run_input_output(cmd, None).compat().await
 }
 
 pub fn generate_compile_commands(

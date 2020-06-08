@@ -35,6 +35,7 @@ use crate::errors::*;
 #[derive(Clone, Debug)]
 pub struct Clang;
 
+#[async_trait::async_trait(?Send)]
 impl CCompilerImpl for Clang {
     fn kind(&self) -> CCompilerKind {
         CCompilerKind::Clang
@@ -47,7 +48,7 @@ impl CCompilerImpl for Clang {
         gcc::parse_arguments(arguments, cwd, (&gcc::ARGS[..], &ARGS[..]))
     }
 
-    fn preprocess<T>(
+    async fn preprocess<T>(
         &self,
         creator: &T,
         executable: &Path,
@@ -56,7 +57,7 @@ impl CCompilerImpl for Clang {
         env_vars: &[(OsString, OsString)],
         may_dist: bool,
         rewrite_includes_only: bool,
-    ) -> SFuture<process::Output>
+    ) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
@@ -70,6 +71,7 @@ impl CCompilerImpl for Clang {
             self.kind(),
             rewrite_includes_only,
         )
+        .await
     }
 
     fn generate_compile_commands(

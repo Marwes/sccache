@@ -23,6 +23,7 @@ use crate::dist;
 use crate::errors::*;
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{run_input_output, OsStrExt};
+use futures::compat::*;
 use log::Level::Trace;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -34,6 +35,7 @@ use std::process;
 #[derive(Clone, Debug)]
 pub struct Diab;
 
+#[async_trait::async_trait(?Send)]
 impl CCompilerImpl for Diab {
     fn kind(&self) -> CCompilerKind {
         CCompilerKind::Diab
@@ -46,7 +48,7 @@ impl CCompilerImpl for Diab {
         parse_arguments(arguments, cwd, &ARGS[..])
     }
 
-    fn preprocess<T>(
+    async fn preprocess<T>(
         &self,
         creator: &T,
         executable: &Path,
@@ -55,11 +57,11 @@ impl CCompilerImpl for Diab {
         env_vars: &[(OsString, OsString)],
         may_dist: bool,
         _rewrite_includes_only: bool,
-    ) -> SFuture<process::Output>
+    ) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
-        preprocess(creator, executable, parsed_args, cwd, env_vars, may_dist)
+        preprocess(creator, executable, parsed_args, cwd, env_vars, may_dist).await
     }
 
     fn generate_compile_commands(
@@ -281,14 +283,14 @@ where
     })
 }
 
-pub fn preprocess<T>(
+pub async fn preprocess<T>(
     creator: &T,
     executable: &Path,
     parsed_args: &ParsedArguments,
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
     _may_dist: bool,
-) -> SFuture<process::Output>
+) -> Result<process::Output>
 where
     T: CommandCreatorSync,
 {
@@ -305,7 +307,7 @@ where
     if log_enabled!(Trace) {
         trace!("preprocess: {:?}", cmd);
     }
-    Box::new(run_input_output(cmd, None))
+    run_input_output(cmd, None).compat().await
 }
 
 pub fn generate_compile_commands(
