@@ -771,7 +771,7 @@ where
         }
     }
 
-    fn bind<T>(self, socket: T) -> impl Future<Output = Result<()>>
+    async fn bind<T>(self, socket: T) -> Result<()>
     where
         T: AsyncRead + AsyncWrite + Unpin + 'static,
     {
@@ -810,7 +810,9 @@ where
             })
             .try_flatten()
             .forward(sink)
-            .map_ok(|_| ())
+            .await?;
+
+        Ok(())
     }
 
     /// Get dist status.
@@ -882,15 +884,15 @@ where
             let compiler_proxies_borrow = self.compiler_proxies.borrow();
 
             if let Some((compiler_proxy, _filetime)) = compiler_proxies_borrow.get(&path) {
-                let fut = compiler_proxy
+                compiler_proxy
                     .resolve_proxied_executable(self.creator.clone(), cwd.clone(), env.as_slice())
-                    .compat();
-                Box::pin(fut.map(|res: Result<_>| res.ok())) as Pin<Box<dyn Future<Output = _>>>
+                    .compat()
+                    .await
+                    .ok()
             } else {
-                Box::pin(async { None })
+                None
             }
-        }
-        .await;
+        };
 
         // use the supplied compiler path as fallback, lookup its modification time too
 
@@ -1198,7 +1200,7 @@ where
                     }
                 }
             };
-            let send = Box::pin(async move { tx.send(Ok(Response::CompileFinished(res))).await });
+            let send = async move { tx.send(Ok(Response::CompileFinished(res))).await };
 
             let me = me.clone();
             let cache_write = async {
