@@ -47,6 +47,7 @@
 
 use crate::errors::*;
 use crate::jobserver::{Acquired, Client};
+use futures::compat::*;
 use futures_01::future::{self, Future};
 use std::boxed::Box;
 use std::ffi::{OsStr, OsString};
@@ -80,6 +81,7 @@ pub trait CommandChild {
 }
 
 /// A trait that provides a subset of the methods of `std::process::Command`.
+#[async_trait::async_trait(?Send)]
 pub trait RunCommand: fmt::Debug {
     /// The type returned by `spawn`.
     type C: CommandChild + 'static;
@@ -112,7 +114,7 @@ pub trait RunCommand: fmt::Debug {
     /// Set the process' stderr from `cfg`.
     fn stderr(&mut self, cfg: Stdio) -> &mut Self;
     /// Execute the process and return a process object.
-    fn spawn(&mut self) -> SFuture<Self::C>;
+    async fn spawn(&mut self) -> Result<Self::C>;
 }
 
 /// A trait that provides a means to create objects implementing `RunCommand`.
@@ -197,6 +199,7 @@ impl AsyncCommand {
 }
 
 /// Trivial implementation of `RunCommand` for `std::process::Command`.
+#[async_trait::async_trait(?Send)]
 impl RunCommand for AsyncCommand {
     type C = Child;
 
@@ -259,21 +262,25 @@ impl RunCommand for AsyncCommand {
         self.inner().stderr(cfg);
         self
     }
-    fn spawn(&mut self) -> SFuture<Child> {
+    async fn spawn(&mut self) -> Result<Child> {
         let mut inner = self.inner.take().unwrap();
         inner.env_remove("MAKEFLAGS");
         inner.env_remove("MFLAGS");
         inner.env_remove("CARGO_MAKEFLAGS");
         self.jobserver.configure(&mut inner);
-        Box::new(self.jobserver.acquire().and_then(move |token| {
-            let child = inner
-                .spawn_async()
-                .with_context(|| format!("failed to spawn {:?}", inner))?;
-            Ok(Child {
-                inner: child,
-                token,
+        self.jobserver
+            .acquire()
+            .and_then(move |token| {
+                let child = inner
+                    .spawn_async()
+                    .with_context(|| format!("failed to spawn {:?}", inner))?;
+                Ok(Child {
+                    inner: child,
+                    token,
+                })
             })
-        }))
+            .compat()
+            .await
     }
 }
 
@@ -436,6 +443,7 @@ pub struct MockCommand {
     pub args: Vec<OsString>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl RunCommand for MockCommand {
     type C = MockChild;
 
@@ -481,10 +489,10 @@ impl RunCommand for MockCommand {
     fn stderr(&mut self, _cfg: Stdio) -> &mut MockCommand {
         self
     }
-    fn spawn(&mut self) -> SFuture<MockChild> {
+    async fn spawn(&mut self) -> Result<MockChild> {
         match self.child.take().unwrap() {
-            ChildOrCall::Child(c) => Box::new(future::result(c)),
-            ChildOrCall::Call(f) => Box::new(future::result(f(&self.args))),
+            ChildOrCall::Child(c) => c,
+            ChildOrCall::Call(f) => f(&self.args),
         }
     }
 }

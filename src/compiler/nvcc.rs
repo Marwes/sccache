@@ -131,9 +131,10 @@ impl CCompilerImpl for NVCC {
         if parsed_args.dependency_args.len() > 0 {
             let first = run_input_output(dep_before_preprocessor(), None);
             let second = run_input_output(cmd, None);
-            first.join(second).map(|(f, s)| s).compat().await
+            let (f, s) = futures::try_join!(first, second)?;
+            Ok(s)
         } else {
-            run_input_output(cmd, None).compat().await
+            run_input_output(cmd, None).await
         }
     }
 

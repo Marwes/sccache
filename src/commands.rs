@@ -484,7 +484,7 @@ where
         trace!("running command: {:?}", cmd);
     }
     let status = runtime.block_on_std(async {
-        let c = cmd.spawn().compat().await?;
+        let c = cmd.spawn().await?;
         c.wait().fcontext("failed to wait for child").compat().await
     })?;
 

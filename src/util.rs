@@ -139,7 +139,7 @@ pub fn fmt_duration_as_secs(duration: &Duration) -> String {
 ///
 /// This was lifted from `std::process::Child::wait_with_output` and modified
 /// to also write to stdin.
-fn wait_with_input_output<T>(mut child: T, input: Option<Vec<u8>>) -> SFuture<process::Output>
+async fn wait_with_input_output<T>(mut child: T, input: Option<Vec<u8>>) -> Result<process::Output>
 where
     T: CommandChild + 'static,
 {
@@ -151,18 +151,21 @@ where
     });
     let stdout = child
         .take_stdout()
-        .map(|io| read_to_end(io, Vec::new()).fcontext("failed to read stdout"));
+        .map(|io| read_to_end(io, Vec::new()).fcontext("failed to read stdout"))
+        .compat();
     let stderr = child
         .take_stderr()
-        .map(|io| read_to_end(io, Vec::new()).fcontext("failed to read stderr"));
+        .map(|io| read_to_end(io, Vec::new()).fcontext("failed to read stderr"))
+        .compat();
 
     // Finish writing stdin before waiting, because waiting drops stdin.
     let status = Future::and_then(stdin, |io| {
         drop(io);
         child.wait().fcontext("failed to wait for child")
-    });
+    })
+    .compat();
 
-    Box::new(status.join3(stdout, stderr).map(|(status, out, err)| {
+    futures::try_join!(status, stdout, stderr).map(|(status, out, err)| {
         let stdout = out.map(|p| p.1);
         let stderr = err.map(|p| p.1);
         process::Output {
@@ -170,17 +173,14 @@ where
             stdout: stdout.unwrap_or_default(),
             stderr: stderr.unwrap_or_default(),
         }
-    }))
+    })
 }
 
 /// Run `command`, writing `input` to its stdin if it is `Some` and return the exit status and output.
 ///
 /// If the command returns a non-successful exit status, an error of `SccacheError::ProcessError`
 /// will be returned containing the process output.
-pub fn run_input_output<C>(
-    mut command: C,
-    input: Option<Vec<u8>>,
-) -> impl Future<Item = process::Output, Error = Error>
+pub async fn run_input_output<C>(mut command: C, input: Option<Vec<u8>>) -> Result<process::Output>
 where
     C: RunCommand,
 {
@@ -193,17 +193,18 @@ where
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn();
+        .spawn()
+        .await?;
 
-    child.and_then(|child| {
-        wait_with_input_output(child, input).and_then(|output| {
+    wait_with_input_output(child, input)
+        .await
+        .and_then(|output| {
             if output.status.success() {
-                f_ok(output)
+                Ok(output)
             } else {
-                f_err(ProcessError(output))
+                Err(ProcessError(output).into())
             }
         })
-    })
 }
 
 /// Write `data` to `writer` with bincode serialization, prefixed by a `u32` length.

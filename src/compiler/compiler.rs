@@ -75,7 +75,7 @@ impl CompileCommand {
             .env_clear()
             .envs(self.env_vars)
             .current_dir(self.cwd);
-        run_input_output(cmd, None).compat().await
+        run_input_output(cmd, None).await
     }
 }
 
@@ -879,7 +879,7 @@ where
         let mut child = creator.clone().new_command_sync(executable);
         child.env_clear().envs(ref_env(env)).args(&["-vV"]);
 
-        run_input_output(child, None).compat().await.map(|output| {
+        run_input_output(child, None).await.map(|output| {
             if let Ok(stdout) = String::from_utf8(output.stdout.clone()) {
                 if stdout.starts_with("rustc ") {
                     return Some(Ok(stdout));
@@ -1011,13 +1011,11 @@ diab
 
     cmd.arg("-E").arg(src);
     trace!("compiler {:?}", cmd);
-    let output = cmd
-        .spawn()
-        .and_then(|child| {
-            child
-                .wait_with_output()
-                .fcontext("failed to read child output")
-        })
+    let child = cmd.spawn().await?;
+
+    let output = child
+        .wait_with_output()
+        .fcontext("failed to read child output")
         .compat()
         .await
         .map(|e| {

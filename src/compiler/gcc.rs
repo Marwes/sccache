@@ -18,7 +18,6 @@ use crate::compiler::{clang, Cacheable, ColorMode, CompileCommand, CompilerArgum
 use crate::dist;
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{run_input_output, OsStrExt};
-use futures::compat::*;
 use log::Level::Trace;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -521,7 +520,7 @@ where
     if log_enabled!(Trace) {
         trace!("preprocess: {:?}", cmd);
     }
-    run_input_output(cmd, None).compat().await
+    run_input_output(cmd, None).await
 }
 
 pub fn generate_compile_commands(
