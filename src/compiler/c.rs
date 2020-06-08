@@ -24,6 +24,7 @@ use crate::dist::pkg;
 use crate::mock_command::CommandCreatorSync;
 use crate::util::{hash_all, Digest, HashToDigest};
 use futures::Future;
+use futures_03::compat::*;
 use futures_cpupool::CpuPool;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -203,14 +204,15 @@ impl<I> CCompiler<I>
 where
     I: CCompilerImpl,
 {
-    pub fn new(compiler: I, executable: PathBuf, pool: &CpuPool) -> SFuture<CCompiler<I>> {
-        Box::new(
-            Digest::file(executable.clone(), &pool).map(move |digest| CCompiler {
+    pub async fn new(compiler: I, executable: PathBuf, pool: &CpuPool) -> Result<CCompiler<I>> {
+        Digest::file(executable.clone(), &pool)
+            .compat()
+            .await
+            .map(move |digest| CCompiler {
                 executable,
                 executable_digest: digest,
                 compiler,
-            }),
-        )
+            })
     }
 }
 

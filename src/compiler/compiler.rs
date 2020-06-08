@@ -1010,21 +1010,18 @@ diab
             "clang" => {
                 debug!("Found clang");
                 return CCompiler::new(Clang, executable, &pool)
-                    .compat()
                     .await
                     .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
             }
             "diab" => {
                 debug!("Found diab");
                 return CCompiler::new(Diab, executable, &pool)
-                    .compat()
                     .await
                     .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
             }
             "gcc" => {
                 debug!("Found GCC");
                 return CCompiler::new(GCC, executable, &pool)
-                    .compat()
                     .await
                     .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
             }
@@ -1048,14 +1045,12 @@ diab
                     executable,
                     &pool,
                 )
-                .compat()
                 .await
                 .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
             }
             "nvcc" => {
                 debug!("Found NVCC");
                 return CCompiler::new(NVCC, executable, &pool)
-                    .compat()
                     .await
                     .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
             }
