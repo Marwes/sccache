@@ -198,7 +198,7 @@ lazy_static! {
 const CACHE_VERSION: &[u8] = b"5";
 
 /// Get absolute paths for all source files listed in rustc's dep-info output.
-fn get_source_files<T>(
+async fn get_source_files<T>(
     creator: &T,
     crate_name: &str,
     executable: &Path,
@@ -206,16 +206,16 @@ fn get_source_files<T>(
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
     pool: &CpuPool,
-) -> SFuture<Vec<PathBuf>>
+) -> Result<Vec<PathBuf>>
 where
     T: CommandCreatorSync,
 {
     let start = time::Instant::now();
     // Get the full list of source files from rustc's dep-info.
-    let temp_dir = ftry!(tempfile::Builder::new()
+    let temp_dir = tempfile::Builder::new()
         .prefix("sccache")
         .tempdir()
-        .context("Failed to create temp dir"));
+        .context("Failed to create temp dir")?;
     let dep_file = temp_dir.path().join("deps.d");
     let mut cmd = creator.clone().new_command_sync(executable);
     cmd.args(&arguments)
@@ -226,29 +226,28 @@ where
         .envs(ref_env(env_vars))
         .current_dir(cwd);
     trace!("[{}]: get dep-info: {:?}", crate_name, cmd);
-    let dep_info = run_input_output(cmd, None);
+    run_input_output(cmd, None).compat().await?;
     // Parse the dep-info file, then hash the contents of those files.
     let pool = pool.clone();
     let cwd = cwd.to_owned();
     let crate_name = crate_name.to_owned();
-    Box::new(dep_info.and_then(move |_| -> SFuture<_> {
-        let name2 = crate_name.clone();
-        let parsed = pool.spawn_fn(move || {
+    let name2 = crate_name.clone();
+    let files = pool
+        .spawn_fn(move || {
             parse_dep_file(&dep_file, &cwd)
                 .with_context(|| format!("Failed to parse dep info for {}", name2))
-        });
-        Box::new(parsed.map(move |files| {
-            trace!(
-                "[{}]: got {} source files from dep-info in {}",
-                crate_name,
-                files.len(),
-                fmt_duration_as_secs(&start.elapsed())
-            );
-            // Just to make sure we capture temp_dir.
-            drop(temp_dir);
-            files
-        }))
-    }))
+        })
+        .compat()
+        .await?;
+    trace!(
+        "[{}]: got {} source files from dep-info in {}",
+        crate_name,
+        files.len(),
+        fmt_duration_as_secs(&start.elapsed())
+    );
+    // Just to make sure we capture temp_dir.
+    drop(temp_dir);
+    Ok(files)
 }
 
 /// Parse dependency info from `file` and return a Vec of files mentioned.
@@ -316,13 +315,13 @@ where
 }
 
 /// Run `rustc --print file-names` to get the outputs of compilation.
-fn get_compiler_outputs<T>(
+async fn get_compiler_outputs<T>(
     creator: &T,
     executable: &Path,
     arguments: Vec<OsString>,
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
-) -> SFuture<Vec<String>>
+) -> Result<Vec<String>>
 where
     T: CommandCreatorSync,
 {
@@ -335,14 +334,12 @@ where
     if log_enabled!(Trace) {
         trace!("get_compiler_outputs: {:?}", cmd);
     }
-    let outputs = run_input_output(cmd, None);
-    Box::new(outputs.and_then(move |output| -> Result<_> {
-        let outstr = String::from_utf8(output.stdout).context("Error parsing rustc output")?;
-        if log_enabled!(Trace) {
-            trace!("get_compiler_outputs: {:?}", outstr);
-        }
-        Ok(outstr.lines().map(|l| l.to_owned()).collect())
-    }))
+    let output = run_input_output(cmd, None).compat().await?;
+    let outstr = String::from_utf8(output.stdout).context("Error parsing rustc output")?;
+    if log_enabled!(Trace) {
+        trace!("get_compiler_outputs: {:?}", outstr);
+    }
+    Ok(outstr.lines().map(|l| l.to_owned()).collect())
 }
 
 impl Rust {
@@ -1297,7 +1294,6 @@ where
                 &env_vars,
                 pool,
             )
-            .compat()
             .await?;
             let source_hashes = hash_all(&source_files, &source_hashes_pool).await?;
             Ok((source_files, source_hashes))
@@ -1399,7 +1395,6 @@ where
             &cwd,
             &env_vars,
         )
-        .compat()
         .await?;
 
         // metadata / dep-info don't ever generate binaries, but
