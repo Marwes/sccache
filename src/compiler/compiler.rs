@@ -28,6 +28,7 @@ use crate::mock_command::{exit_status, CommandChild, CommandCreatorSync, RunComm
 use crate::util::{fmt_duration_as_secs, ref_env, run_input_output};
 use filetime::FileTime;
 use futures::Future;
+use futures_03::compat::*;
 use futures_cpupool::CpuPool;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -821,14 +822,14 @@ pub fn write_temp_file(
 }
 
 /// If `executable` is a known compiler, return `Some(Box<Compiler>)`.
-fn detect_compiler<T>(
+async fn detect_compiler<T>(
     creator: T,
     executable: &Path,
     cwd: &Path,
     env: &[(OsString, OsString)],
     pool: &CpuPool,
     dist_archive: Option<PathBuf>,
-) -> SFuture<(Box<dyn Compiler<T>>, Option<Box<dyn CompilerProxy<T>>>)>
+) -> Result<(Box<dyn Compiler<T>>, Option<Box<dyn CompilerProxy<T>>>)>
 where
     T: CommandCreatorSync,
 {
@@ -836,7 +837,7 @@ where
 
     // First, see if this looks like rustc.
     let filename = match executable.file_stem() {
-        None => return f_err(anyhow!("could not determine compiler kind")),
+        None => return Err(anyhow!("could not determine compiler kind")),
         Some(f) => f,
     };
     let filename = filename.to_string_lossy().to_lowercase();
@@ -847,16 +848,16 @@ where
         let mut child = creator.clone().new_command_sync(executable);
         child.env_clear().envs(ref_env(env)).args(&["-vV"]);
 
-        Box::new(run_input_output(child, None).map(|output| {
+        run_input_output(child, None).compat().await.map(|output| {
             if let Ok(stdout) = String::from_utf8(output.stdout.clone()) {
                 if stdout.starts_with("rustc ") {
                     return Some(Ok(stdout));
                 }
             }
             Some(Err(ProcessError(output)))
-        }))
+        })?
     } else {
-        f_ok(None)
+        None
     };
 
     let creator1 = creator.clone();
@@ -868,95 +869,92 @@ where
     let env3 = env.to_owned();
     let pool = pool.clone();
     let cwd = cwd.to_owned().clone();
-    Box::new(
-        rustc_vv
-            .and_then(move |rustc_vv| match rustc_vv {
-            Some(Ok(rustc_verbose_version)) => {
-                debug!("Found rustc");
+    match rustc_vv {
+        Some(Ok(rustc_verbose_version)) => {
+            debug!("Found rustc");
 
-                Box::new(
-                    RustupProxy::find_proxy_executable::<T>(&executable2,"rustup", creator, &env1)
-                        .and_then(move |proxy : Result<Option<RustupProxy>>| -> SFuture<(Option<RustupProxy>, PathBuf)> {
-                            match proxy {
-                                Ok(Some(proxy)) => {
-                                    trace!("Found rustup proxy executable");
-                                    let fut =
-                                        proxy
-                                            .resolve_proxied_executable(creator1, cwd, &env2)
-                                            .then(move |res| {
-                                                // take the pathbuf for rustc as resolved by the proxy
-                                                match res {
-                                                    Ok((resolved_path, _time)) => {
-                                                        trace!("Resolved path with rustup proxy {:?}", &resolved_path);
-                                                        f_ok((Some(proxy), resolved_path))
-                                                    },
-                                                    Err(e) => {
-                                                        trace!("Could not resolve compiler with rustup proxy: {}", e);
-                                                        f_ok((None, executable))
-                                                    },
-                                                }
-                                            });
-                                    Box::new(fut)
-                                },
-                                Ok(None) => {
-                                    trace!("Did not find rustup");
-                                    f_ok((None, executable))
-                                },
-                                Err(e) => {
-                                    trace!("Did not find rustup due to {}", e);
-                                    f_ok((None, executable))
-                                },
+            let res: Result<(Option<RustupProxy>, PathBuf)> = async {
+                let proxy: Result<Option<RustupProxy>> =
+                    RustupProxy::find_proxy_executable::<T>(&executable2, "rustup", creator, &env1)
+                        .compat()
+                        .await?;
+                match proxy {
+                    Ok(Some(proxy)) => {
+                        trace!("Found rustup proxy executable");
+                        // take the pathbuf for rustc as resolved by the proxy
+                        match proxy
+                            .resolve_proxied_executable(creator1, cwd, &env2)
+                            .compat()
+                            .await
+                        {
+                            Ok((resolved_path, _time)) => {
+                                trace!("Resolved path with rustup proxy {:?}", &resolved_path);
+                                Ok((Some(proxy), resolved_path))
                             }
-                        })
-                        .then(move |res: Result<(Option<RustupProxy>, PathBuf)>| {
-                            let (proxy, resolved_rustc) : (_, PathBuf)
-                                = res
-                                    .map(|(proxy,resolved_compiler_executable)| {
-                                        (
-                                            proxy.map(Box::new).map(|x : Box<RustupProxy>| {
-                                                x as Box<dyn CompilerProxy<T>>
-                                            }),
-                                            resolved_compiler_executable
-                                        )
-                                    })
-                                    .unwrap_or_else(|_e| {
-                                        trace!("Compiling rust without proxy");
-                                        (None, executable2)
-                                    });
-
-                            Rust::new(
-                                creator2,
-                                resolved_rustc,
-                                &env3,
-                                &rustc_verbose_version,
-                                dist_archive,
-                                pool,
-                            )
-                            .map(|c| {
-                                (
-                                    Box::new(c) as Box<dyn Compiler<T> >,
-                                    proxy as Option<Box<dyn CompilerProxy<T>>>
-                                )
-                            })
+                            Err(e) => {
+                                trace!("Could not resolve compiler with rustup proxy: {}", e);
+                                Ok((None, executable))
+                            }
+                        }
                     }
-                )
-            )
+                    Ok(None) => {
+                        trace!("Did not find rustup");
+                        Ok((None, executable))
+                    }
+                    Err(e) => {
+                        trace!("Did not find rustup due to {}", e);
+                        Ok((None, executable))
+                    }
+                }
             }
-            Some(Err(e)) => f_err(e),
-            None => {
-                let cc = detect_c_compiler(creator, executable, env1.to_vec(), pool);
-                Box::new(cc.map(|c : Box<dyn Compiler<T>>| { (c, None ) }))
-            },
-        })
-    )
+            .await;
+
+            let (proxy, resolved_rustc): (_, PathBuf) = res
+                .map(|(proxy, resolved_compiler_executable)| {
+                    (
+                        proxy
+                            .map(Box::new)
+                            .map(|x: Box<RustupProxy>| x as Box<dyn CompilerProxy<T>>),
+                        resolved_compiler_executable,
+                    )
+                })
+                .unwrap_or_else(|_e| {
+                    trace!("Compiling rust without proxy");
+                    (None, executable2)
+                });
+
+            Rust::new(
+                creator2,
+                resolved_rustc,
+                &env3,
+                &rustc_verbose_version,
+                dist_archive,
+                pool,
+            )
+            .compat()
+            .await
+            .map(|c| {
+                (
+                    Box::new(c) as Box<dyn Compiler<T>>,
+                    proxy as Option<Box<dyn CompilerProxy<T>>>,
+                )
+            })
+        }
+        Some(Err(e)) => Err(e.into()),
+        None => {
+            let c: Box<dyn Compiler<T>> =
+                detect_c_compiler(creator, executable, env1.to_vec(), pool).await?;
+            Ok((c, None))
+        }
+    }
 }
 
-fn detect_c_compiler<T>(
+async fn detect_c_compiler<T>(
     creator: T,
     executable: PathBuf,
     env: Vec<(OsString, OsString)>,
     pool: CpuPool,
-) -> SFuture<Box<dyn Compiler<T>>>
+) -> Result<Box<dyn Compiler<T>>>
 where
     T: CommandCreatorSync,
 {
@@ -979,67 +977,71 @@ diab
 #endif
 "
     .to_vec();
-    let write = write_temp_file(&pool, "testfile.c".as_ref(), test);
+    let (tempdir, src) = write_temp_file(&pool, "testfile.c".as_ref(), test)
+        .compat()
+        .await?;
 
     let mut cmd = creator.clone().new_command_sync(&executable);
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .envs(env.iter().map(|s| (&s.0, &s.1)));
-    let output = write.and_then(move |(tempdir, src)| {
-        cmd.arg("-E").arg(src);
-        trace!("compiler {:?}", cmd);
-        cmd.spawn()
-            .and_then(|child| {
-                child
-                    .wait_with_output()
-                    .fcontext("failed to read child output")
-            })
-            .map(|e| {
-                drop(tempdir);
-                e
-            })
-    });
 
-    Box::new(output.and_then(move |output| -> SFuture<_> {
-        let stdout = match str::from_utf8(&output.stdout) {
-            Ok(s) => s,
-            Err(_) => return f_err(anyhow!("Failed to parse output")),
-        };
-        for line in stdout.lines() {
-            //TODO: do something smarter here.
-            match line {
-                "clang" => {
-                    debug!("Found clang");
-                    return Box::new(
-                        CCompiler::new(Clang, executable, &pool)
-                            .map(|c| Box::new(c) as Box<dyn Compiler<T>>),
-                    );
-                }
-                "diab" => {
-                    debug!("Found diab");
-                    return Box::new(
-                        CCompiler::new(Diab, executable, &pool)
-                            .map(|c| Box::new(c) as Box<dyn Compiler<T>>),
-                    );
-                }
-                "gcc" => {
-                    debug!("Found GCC");
-                    return Box::new(
-                        CCompiler::new(GCC, executable, &pool)
-                            .map(|c| Box::new(c) as Box<dyn Compiler<T>>),
-                    );
-                }
-                "msvc" | "msvc-clang" => {
-                    let is_clang = line == "msvc-clang";
-                    debug!("Found MSVC (is clang: {})", is_clang);
-                    let prefix = msvc::detect_showincludes_prefix(
-                        &creator,
-                        executable.as_ref(),
-                        is_clang,
-                        env,
-                        &pool,
-                    );
-                    return Box::new(prefix.and_then(move |prefix| {
+    cmd.arg("-E").arg(src);
+    trace!("compiler {:?}", cmd);
+    let output = cmd
+        .spawn()
+        .and_then(|child| {
+            child
+                .wait_with_output()
+                .fcontext("failed to read child output")
+        })
+        .compat()
+        .await
+        .map(|e| {
+            drop(tempdir);
+            e
+        })?;
+
+    let stdout = match str::from_utf8(&output.stdout) {
+        Ok(s) => s,
+        Err(_) => return Err(anyhow!("Failed to parse output")),
+    };
+    for line in stdout.lines() {
+        //TODO: do something smarter here.
+        match line {
+            "clang" => {
+                debug!("Found clang");
+                return CCompiler::new(Clang, executable, &pool)
+                    .map(|c| Box::new(c) as Box<dyn Compiler<T>>)
+                    .compat()
+                    .await;
+            }
+            "diab" => {
+                debug!("Found diab");
+                return CCompiler::new(Diab, executable, &pool)
+                    .map(|c| Box::new(c) as Box<dyn Compiler<T>>)
+                    .compat()
+                    .await;
+            }
+            "gcc" => {
+                debug!("Found GCC");
+                return CCompiler::new(GCC, executable, &pool)
+                    .map(|c| Box::new(c) as Box<dyn Compiler<T>>)
+                    .compat()
+                    .await;
+            }
+            "msvc" | "msvc-clang" => {
+                let is_clang = line == "msvc-clang";
+                debug!("Found MSVC (is clang: {})", is_clang);
+                let prefix = msvc::detect_showincludes_prefix(
+                    &creator,
+                    executable.as_ref(),
+                    is_clang,
+                    env,
+                    &pool,
+                );
+                return prefix
+                    .and_then(move |prefix| {
                         trace!("showIncludes prefix: '{}'", prefix);
                         CCompiler::new(
                             MSVC {
@@ -1050,42 +1052,43 @@ diab
                             &pool,
                         )
                         .map(|c| Box::new(c) as Box<dyn Compiler<T>>)
-                    }));
-                }
-                "nvcc" => {
-                    debug!("Found NVCC");
-                    return Box::new(
-                        CCompiler::new(NVCC, executable, &pool)
-                            .map(|c| Box::new(c) as Box<dyn Compiler<T>>),
-                    );
-                }
-                _ => (),
+                    })
+                    .compat()
+                    .await;
             }
+            "nvcc" => {
+                debug!("Found NVCC");
+                return CCompiler::new(NVCC, executable, &pool)
+                    .map(|c| Box::new(c) as Box<dyn Compiler<T>>)
+                    .compat()
+                    .await;
+            }
+            _ => (),
         }
+    }
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        debug!("nothing useful in detection output {:?}", stdout);
-        debug!("compiler status: {}", output.status);
-        debug!("compiler stderr:\n{}", stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    debug!("nothing useful in detection output {:?}", stdout);
+    debug!("compiler status: {}", output.status);
+    debug!("compiler stderr:\n{}", stderr);
 
-        f_err(anyhow!(stderr.into_owned()))
-    }))
+    Err(anyhow!(stderr.into_owned()))
 }
 
 /// If `executable` is a known compiler, return a `Box<Compiler>` containing information about it.
-pub fn get_compiler_info<T>(
+pub async fn get_compiler_info<T>(
     creator: T,
     executable: &Path,
     cwd: &Path,
     env: &[(OsString, OsString)],
     pool: &CpuPool,
     dist_archive: Option<PathBuf>,
-) -> SFuture<(Box<dyn Compiler<T>>, Option<Box<dyn CompilerProxy<T>>>)>
+) -> Result<(Box<dyn Compiler<T>>, Option<Box<dyn CompilerProxy<T>>>)>
 where
     T: CommandCreatorSync,
 {
     let pool = pool.clone();
-    detect_compiler(creator, executable, cwd, env, &pool, dist_archive)
+    detect_compiler(creator, executable, cwd, env, &pool, dist_archive).await
 }
 
 #[cfg(test)]
@@ -1096,6 +1099,7 @@ mod test {
     use crate::mock_command::*;
     use crate::test::mock_storage::MockStorage;
     use crate::test::utils::*;
+    use crate::util::FutureWait;
     use futures::{future, Future};
     use futures_cpupool::CpuPool;
     use std::fs::{self, File};

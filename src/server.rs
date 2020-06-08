@@ -958,7 +958,6 @@ where
                         &me.pool,
                         dist_info.clone().map(|(p, _)| p),
                     )
-                    .compat()
                     .await;
 
                 match info {

@@ -655,8 +655,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
 
             runtime.block_on_std(async {
                 let compiler =
-                    compiler::get_compiler_info(creator, &executable, &cwd, &env, &pool, None)
-                        .compat();
+                    compiler::get_compiler_info(creator, &executable, &cwd, &env, &pool, None);
                 let packager = compiler.map_ok(|c| c.0.get_toolchain_packager());
                 packager
                     .and_then(|p| async move { p.write_pkg(out_file) })

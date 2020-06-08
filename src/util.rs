@@ -529,6 +529,23 @@ pub fn daemonize() -> Result<()> {
 }
 
 #[cfg(test)]
+pub trait FutureWait: std::future::Future {
+    fn wait(self) -> Self::Output;
+}
+
+#[cfg(test)]
+impl<F> FutureWait for F
+where
+    F: std::future::Future,
+{
+    fn wait(self) -> Self::Output {
+        tokio_compat::runtime::Runtime::new()
+            .unwrap()
+            .block_on_std(self)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::OsStrExt;
     use std::ffi::{OsStr, OsString};
