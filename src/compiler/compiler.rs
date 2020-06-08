@@ -28,7 +28,7 @@ use crate::mock_command::{exit_status, CommandChild, CommandCreatorSync, RunComm
 use crate::util::{fmt_duration_as_secs, ref_env, run_input_output};
 use filetime::FileTime;
 use futures_01::Future;
-use futures_03::compat::*;
+use futures::compat::*;
 use futures_cpupool::CpuPool;
 use std::borrow::Cow;
 use std::collections::HashMap;

@@ -31,8 +31,8 @@ use crate::util;
 use anyhow::Context as _;
 use bytes::{buf::ext::BufMutExt, Bytes, BytesMut};
 use filetime::FileTime;
+use futures::{channel::mpsc, compat::*, future, prelude::*, stream};
 use futures_01::Future as _;
-use futures_03::{channel::mpsc, compat::*, future, prelude::*, stream};
 use futures_cpupool::CpuPool;
 use number_prefix::{binary_prefix, Prefixed, Standalone};
 use std::cell::RefCell;
@@ -1544,7 +1544,7 @@ impl<R> Body<R> {
     }
 }
 
-impl<R> futures_03::Stream for Body<R> {
+impl<R> futures::Stream for Body<R> {
     type Item = Result<R>;
     fn poll_next(
         mut self: Pin<&mut Self>,
@@ -1611,8 +1611,8 @@ where
 ///   below.
 struct SccacheTransport<I: AsyncRead + AsyncWrite + Unpin> {
     inner: Framed<
-        futures_03::stream::ErrInto<
-            futures_03::sink::SinkErrInto<
+        futures::stream::ErrInto<
+            futures::sink::SinkErrInto<
                 tokio_util::codec::Framed<I, LengthDelimitedCodec>,
                 Bytes,
                 Error,

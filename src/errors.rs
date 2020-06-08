@@ -67,7 +67,7 @@ pub type Result<T> = anyhow::Result<T>;
 
 pub type SFuture<T> = Box<dyn Future<Item = T, Error = Error>>;
 pub type SFutureSend<T> = Box<dyn Future<Item = T, Error = Error> + Send>;
-pub type SFutureStd<'a, T> = futures_03::future::BoxFuture<'a, Result<T>>;
+pub type SFutureStd<'a, T> = futures::future::BoxFuture<'a, Result<T>>;
 
 pub trait FutureContext<T> {
     fn fcontext<C>(self, context: C) -> SFuture<T>

@@ -20,7 +20,7 @@ use crate::mock_command::*;
 use crate::server::{DistClientContainer, SccacheServer, ServerMessage};
 use crate::test::utils::*;
 use futures_01::sync::oneshot::{self, Sender};
-use futures_03::compat::*;
+use futures::compat::*;
 use futures_cpupool::CpuPool;
 use std::fs::File;
 use std::io::{Cursor, Write};

@@ -21,7 +21,7 @@ use crate::dist;
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::run_input_output;
 use futures_01::future::Future;
-use futures_03::compat::*;
+use futures::compat::*;
 use futures_cpupool::CpuPool;
 use local_encoding::{Encoder, Encoding};
 use log::Level::Debug;
