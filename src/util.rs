@@ -15,7 +15,8 @@
 use crate::mock_command::{CommandChild, RunCommand};
 use blake3::Hasher as blake3_Hasher;
 use byteorder::{BigEndian, ByteOrder};
-use futures_01::{future, Future};
+use futures::{compat::*, future};
+use futures_01::Future;
 use futures_cpupool::CpuPool;
 use serde::Serialize;
 use std::ffi::{OsStr, OsString};
@@ -43,11 +44,11 @@ impl Digest {
 
     /// Calculate the BLAKE3 digest of the contents of `path`, running
     /// the actual hash computation on a background thread in `pool`.
-    pub fn file<T>(path: T, pool: &CpuPool) -> SFuture<String>
+    pub async fn file<T>(path: T, pool: &CpuPool) -> Result<String>
     where
         T: AsRef<Path>,
     {
-        Self::reader(path.as_ref().to_owned(), pool)
+        Self::reader(path.as_ref().to_owned(), pool).compat().await
     }
 
     /// Calculate the BLAKE3 digest of the contents read from `reader`.
@@ -109,26 +110,24 @@ pub fn hex(bytes: &[u8]) -> String {
 
 /// Calculate the digest of each file in `files` on background threads in
 /// `pool`.
-pub fn hash_all(files: &[PathBuf], pool: &CpuPool) -> SFuture<Vec<String>> {
+pub async fn hash_all(files: &[PathBuf], pool: &CpuPool) -> Result<Vec<String>> {
     let start = time::Instant::now();
     let count = files.len();
-    let pool = pool.clone();
-    Box::new(
-        future::join_all(
-            files
-                .iter()
-                .map(move |f| Digest::file(f, &pool))
-                .collect::<Vec<_>>(),
-        )
-        .map(move |hashes| {
-            trace!(
-                "Hashed {} files in {}",
-                count,
-                fmt_duration_as_secs(&start.elapsed())
-            );
-            hashes
-        }),
+    future::try_join_all(
+        files
+            .iter()
+            .map(move |f| async move { Digest::file(f, pool).await })
+            .collect::<Vec<_>>(),
     )
+    .await
+    .map(move |hashes| {
+        trace!(
+            "Hashed {} files in {}",
+            count,
+            fmt_duration_as_secs(&start.elapsed())
+        );
+        hashes
+    })
 }
 
 /// Format `duration` as seconds with a fractional component.

@@ -26,8 +26,8 @@ use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{fmt_duration_as_secs, hash_all, run_input_output, Digest};
 use crate::util::{ref_env, HashToDigest, OsStrExt};
 use filetime::FileTime;
-use futures_01::Future;
 use futures::{compat::*, future};
+use futures_01::Future;
 use futures_cpupool::CpuPool;
 use log::Level::Trace;
 #[cfg(feature = "dist-client")]
@@ -426,30 +426,24 @@ impl Rust {
                     None
                 }
             };
-            return hash_all(&libs, &pool)
-                .compat()
-                .await
-                .map(move |digests| Rust {
-                    executable,
-                    host,
-                    sysroot,
-                    compiler_shlibs_digests: digests,
-                    rlib_dep_reader,
-                });
+            return hash_all(&libs, &pool).await.map(move |digests| Rust {
+                executable,
+                host,
+                sysroot,
+                compiler_shlibs_digests: digests,
+                rlib_dep_reader,
+            });
         }
 
         #[cfg(not(feature = "dist-client"))]
         {
             let (sysroot, libs) = sysroot_and_libs.await?;
-            return hash_all(&libs, &pool)
-                .compat()
-                .await
-                .map(move |digests| Rust {
-                    executable,
-                    host,
-                    sysroot,
-                    compiler_shlibs_digests: digests,
-                });
+            return hash_all(&libs, &pool).await.map(move |digests| Rust {
+                executable,
+                host,
+                sysroot,
+                compiler_shlibs_digests: digests,
+            });
         }
     }
 }
@@ -1293,19 +1287,21 @@ where
             .collect::<Vec<_>>();
         // Find all the source files and hash them
         let source_hashes_pool = pool.clone();
-        let source_files = get_source_files(
-            creator,
-            &crate_name,
-            &executable,
-            &filtered_arguments,
-            &cwd,
-            &env_vars,
-            pool,
-        );
-        let source_files_and_hashes = source_files.and_then(move |source_files| {
-            hash_all(&source_files, &source_hashes_pool)
-                .map(|source_hashes| (source_files, source_hashes))
-        });
+        let source_files_and_hashes = async {
+            let source_files = get_source_files(
+                creator,
+                &crate_name,
+                &executable,
+                &filtered_arguments,
+                &cwd,
+                &env_vars,
+                pool,
+            )
+            .compat()
+            .await?;
+            let source_hashes = hash_all(&source_files, &source_hashes_pool).await?;
+            Ok((source_files, source_hashes))
+        };
         // Hash the contents of the externs listed on the commandline.
         trace!("[{}]: hashing {} externs", crate_name, externs.len());
         let abs_externs = externs.iter().map(|e| cwd.join(e)).collect::<Vec<_>>();
@@ -1316,10 +1312,7 @@ where
         let staticlib_hashes = hash_all(&abs_staticlibs, pool);
         let creator = creator.clone();
         let ((source_files, source_hashes), extern_hashes, staticlib_hashes) =
-            source_files_and_hashes
-                .join3(extern_hashes, staticlib_hashes)
-                .compat()
-                .await?;
+            futures::try_join!(source_files_and_hashes, extern_hashes, staticlib_hashes,)?;
 
         // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
         let mut m = Digest::new();
