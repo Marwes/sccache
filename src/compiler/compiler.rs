@@ -878,7 +878,6 @@ where
             let res: Result<(Option<RustupProxy>, PathBuf)> = async {
                 let proxy: Result<Option<RustupProxy>> =
                     RustupProxy::find_proxy_executable::<T>(&executable2, "rustup", creator, &env1)
-                        .compat()
                         .await?;
                 match proxy {
                     Ok(Some(proxy)) => {
@@ -933,7 +932,6 @@ where
                 dist_archive,
                 pool,
             )
-            .compat()
             .await
             .map(|c| {
                 (
