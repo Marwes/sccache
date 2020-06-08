@@ -66,7 +66,7 @@ pub struct CompileCommand {
 }
 
 impl CompileCommand {
-    pub fn execute<T>(self, creator: &T) -> SFuture<process::Output>
+    pub async fn execute<T>(self, creator: &T) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
@@ -75,7 +75,7 @@ impl CompileCommand {
             .env_clear()
             .envs(self.env_vars)
             .current_dir(self.cwd);
-        Box::new(run_input_output(cmd, None))
+        run_input_output(cmd, None).compat().await
     }
 }
 
@@ -392,7 +392,6 @@ where
     debug!("[{}]: Compiling locally", out_pretty);
     compile_cmd
         .execute(&creator)
-        .compat()
         .await
         .map(move |o| (cacheable, DistType::NoDist, o))
 }
@@ -426,7 +425,6 @@ where
             debug!("[{}]: Compiling locally", out_pretty);
             return compile_cmd
                 .execute(&creator)
-                .compat()
                 .await
                 .map(move |o| (cacheable, DistType::NoDist, o));
         }
@@ -609,7 +607,6 @@ where
                 );
                 compile_cmd
                     .execute(&creator)
-                    .compat()
                     .await
                     .map(|o| (DistType::Error, o))
             }
