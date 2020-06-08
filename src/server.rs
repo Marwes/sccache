@@ -1131,7 +1131,7 @@ where
                             }
                             stats.cache_misses.increment(&kind);
                             stats.cache_read_miss_duration += duration;
-                            cache_write = Some(future.compat());
+                            cache_write = Some(future);
                         }
                         CompileResult::NotCacheable => {
                             stats.cache_misses.increment(&kind);

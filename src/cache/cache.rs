@@ -24,6 +24,7 @@ use crate::cache::redis::RedisCache;
 #[cfg(feature = "s3")]
 use crate::cache::s3::S3Cache;
 use crate::config::{self, CacheType, Config};
+use futures::compat::*;
 use futures_cpupool::CpuPool;
 use std::fmt;
 use std::fs;
@@ -174,11 +175,11 @@ impl CacheWrite {
     }
 
     /// Create a new cache entry populated with the contents of `objects`.
-    pub fn from_objects<T>(objects: T, pool: &CpuPool) -> SFuture<CacheWrite>
+    pub async fn from_objects<T>(objects: T, pool: &CpuPool) -> Result<CacheWrite>
     where
         T: IntoIterator<Item = (String, PathBuf)> + Send + Sync + 'static,
     {
-        Box::new(pool.spawn_fn(move || -> Result<_> {
+        pool.spawn_fn(move || -> Result<_> {
             let mut entry = CacheWrite::new();
             for (key, path) in objects {
                 let mut f = fs::File::open(&path)?;
@@ -188,7 +189,9 @@ impl CacheWrite {
                     .with_context(|| format!("failed to put object `{:?}` in cache entry", path))?;
             }
             Ok(entry)
-        }))
+        })
+        .compat()
+        .await
     }
 
     /// Add an object containing the contents of `from` to this cache entry at `name`.

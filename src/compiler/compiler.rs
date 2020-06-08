@@ -333,7 +333,6 @@ where
             fmt_duration_as_secs(&duration)
         );
         let mut entry = CacheWrite::from_objects(outputs, &pool)
-            .compat()
             .await
             .context("failed to zip up compiler outputs")?;
         let o = out_pretty.clone();
@@ -346,17 +345,20 @@ where
 
         // Try to finish storing the newly-written cache
         // entry. We'll get the result back elsewhere.
-        let future = storage.put(&key, entry).then(move |res| {
-            match res {
-                Ok(_) => debug!("[{}]: Stored in cache successfully!", out_pretty),
-                Err(ref e) => debug!("[{}]: Cache write error: {:?}", out_pretty, e),
-            }
-            res.map(|duration| CacheWriteInfo {
-                object_file_pretty: out_pretty,
-                duration,
+        let future = storage
+            .put(&key, entry)
+            .then(move |res| {
+                match res {
+                    Ok(_) => debug!("[{}]: Stored in cache successfully!", out_pretty),
+                    Err(ref e) => debug!("[{}]: Cache write error: {:?}", out_pretty, e),
+                }
+                res.map(|duration| CacheWriteInfo {
+                    object_file_pretty: out_pretty,
+                    duration,
+                })
             })
-        });
-        let future = Box::new(future);
+            .compat();
+        let future = Box::pin(future);
         Ok((
             CompileResult::CacheMiss(miss_type, dist_type, duration, future),
             compiler_result,
@@ -749,7 +751,12 @@ pub enum CompileResult {
     ///
     /// The `CacheWriteFuture` will resolve when the result is finished
     /// being stored in the cache.
-    CacheMiss(MissType, DistType, Duration, SFuture<CacheWriteInfo>),
+    CacheMiss(
+        MissType,
+        DistType,
+        Duration,
+        SFutureStd<'static, CacheWriteInfo>,
+    ),
     /// Not in cache, but the compilation result was determined to be not cacheable.
     NotCacheable,
     /// Not in cache, but compilation failed.
@@ -1108,7 +1115,6 @@ mod test {
     use crate::mock_command::*;
     use crate::test::mock_storage::MockStorage;
     use crate::test::utils::*;
-    use futures_01::Future;
     use futures_cpupool::CpuPool;
     use std::fs::{self, File};
     use std::io::Write;
