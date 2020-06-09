@@ -511,12 +511,9 @@ impl<C: CommandCreatorSync> SccacheServer<C> {
             async move {
                 trace!("incoming connection");
                 tokio_compat::runtime::current_thread::TaskExecutor::current()
-                    .spawn_local(Box::new(
-                        Box::pin(service.bind(socket).map_err(|err| {
-                            error!("{}", err);
-                        }))
-                        .compat(),
-                    ))
+                    .spawn_local_std(service.bind(socket).unwrap_or_else(|err| {
+                        error!("{}", err);
+                    }))
                     .unwrap();
                 Ok(())
             }
@@ -1193,7 +1190,9 @@ where
                     }
                 }
             };
-            let send = async move { tx.send(Ok(Response::CompileFinished(res))).await };
+            let send = async move {
+                let _ = tx.send(Ok(Response::CompileFinished(res))).await;
+            };
 
             let me = me.clone();
             let cache_write = async {
@@ -1215,14 +1214,13 @@ where
                         }
                     }
                 }
-                Ok(())
             };
 
-            future::try_join(send, cache_write).map(|_| Ok(())).await
+            let ((), ()) = future::join(send, cache_write).await;
         };
 
         tokio_compat::runtime::current_thread::TaskExecutor::current()
-            .spawn_local(Box::new(Box::pin(task).compat()))
+            .spawn_local_std(task)
             .unwrap();
     }
 }
