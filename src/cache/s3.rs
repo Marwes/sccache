@@ -17,7 +17,7 @@ use crate::simples3::{
     AutoRefreshingProvider, Bucket, ChainProvider, ProfileProvider, ProvideAwsCredentials, Ssl,
 };
 use directories::UserDirs;
-use futures_01::future;
+use futures::compat::*;
 use futures_01::future::Future;
 use std::io;
 use std::rc::Rc;
@@ -58,8 +58,9 @@ fn normalize_key(key: &str) -> String {
     format!("{}/{}/{}/{}", &key[0..1], &key[1..2], &key[2..3], &key)
 }
 
+#[async_trait::async_trait(?Send)]
 impl Storage for S3Cache {
-    fn get(&self, key: &str) -> SFuture<Cache> {
+    async fn get(&self, key: &str) -> Result<Cache> {
         let key = normalize_key(key);
 
         let result_cb = |result| match result {
@@ -74,8 +75,7 @@ impl Storage for S3Cache {
         };
 
         let bucket = self.bucket.clone();
-        let response = self
-            .provider
+        self.provider
             .credentials()
             .then(move |credentials| match credentials {
                 Ok(creds) => bucket.get(&key, Some(&creds)),
@@ -84,16 +84,17 @@ impl Storage for S3Cache {
                     bucket.get(&key, None)
                 }
             })
-            .then(result_cb);
-        Box::new(response)
+            .then(result_cb)
+            .compat()
+            .await
     }
 
-    fn put(&self, key: &str, entry: CacheWrite) -> SFuture<Duration> {
+    async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
         let key = normalize_key(&key);
         let start = Instant::now();
         let data = match entry.finish() {
             Ok(data) => data,
-            Err(e) => return f_err(e),
+            Err(e) => return Err(e),
         };
         let credentials = self
             .provider
@@ -107,17 +108,17 @@ impl Storage for S3Cache {
                 .fcontext("failed to put cache entry in s3")
         });
 
-        Box::new(response.map(move |_| start.elapsed()))
+        response.map(move |_| start.elapsed()).compat().await
     }
 
     fn location(&self) -> String {
         format!("S3, bucket: {}", self.bucket)
     }
 
-    fn current_size(&self) -> SFuture<Option<u64>> {
-        Box::new(future::ok(None))
+    async fn current_size(&self) -> Result<Option<u64>> {
+        Ok(None)
     }
-    fn max_size(&self) -> SFuture<Option<u64>> {
-        Box::new(future::ok(None))
+    async fn max_size(&self) -> Result<Option<u64>> {
+        Ok(None)
     }
 }

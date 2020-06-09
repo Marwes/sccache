@@ -20,6 +20,7 @@ use crate::{
     errors::*,
     util::HeadersExt,
 };
+use futures::compat::*;
 use futures_01::{
     future::{self, Shared},
     Async, Future, Stream,
@@ -499,51 +500,50 @@ impl GCSCache {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Storage for GCSCache {
-    fn get(&self, key: &str) -> SFuture<Cache> {
-        Box::new(
-            self.bucket
-                .get(&key, &self.credential_provider)
-                .then(|result| match result {
-                    Ok(data) => {
-                        let hit = CacheRead::from(io::Cursor::new(data))?;
-                        Ok(Cache::Hit(hit))
-                    }
-                    Err(e) => {
-                        warn!("Got GCS error: {:?}", e);
-                        Ok(Cache::Miss)
-                    }
-                }),
-        )
+    async fn get(&self, key: &str) -> Result<Cache> {
+        self.bucket
+            .get(&key, &self.credential_provider)
+            .then(|result| match result {
+                Ok(data) => {
+                    let hit = CacheRead::from(io::Cursor::new(data))?;
+                    Ok(Cache::Hit(hit))
+                }
+                Err(e) => {
+                    warn!("Got GCS error: {:?}", e);
+                    Ok(Cache::Miss)
+                }
+            })
+            .compat()
+            .await
     }
 
-    fn put(&self, key: &str, entry: CacheWrite) -> SFuture<time::Duration> {
+    async fn put(&self, key: &str, entry: CacheWrite) -> Result<time::Duration> {
         if let RWMode::ReadOnly = self.rw_mode {
-            return Box::new(future::ok(time::Duration::new(0, 0)));
+            return Ok(time::Duration::new(0, 0));
         }
 
         let start = time::Instant::now();
-        let data = match entry.finish() {
-            Ok(data) => data,
-            Err(e) => return Box::new(future::err(e)),
-        };
+        let data = entry.finish()?;
         let bucket = self.bucket.clone();
         let response = bucket
             .put(&key, data, &self.credential_provider)
             .fcontext("failed to put cache entry in GCS");
 
-        Box::new(response.map(move |_| start.elapsed()))
+        response.map(move |_| start.elapsed()).compat().await
     }
 
     fn location(&self) -> String {
         format!("GCS, bucket: {}", self.bucket)
     }
 
-    fn current_size(&self) -> SFuture<Option<u64>> {
-        Box::new(future::ok(None))
+    async fn current_size(&self) -> Result<Option<u64>> {
+        Ok(None)
     }
-    fn max_size(&self) -> SFuture<Option<u64>> {
-        Box::new(future::ok(None))
+
+    async fn max_size(&self) -> Result<Option<u64>> {
+        Ok(None)
     }
 }
 

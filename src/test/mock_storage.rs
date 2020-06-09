@@ -14,7 +14,7 @@
 
 use crate::cache::{Cache, CacheWrite, Storage};
 use crate::errors::*;
-use futures_01::future;
+use futures::compat::*;
 use std::cell::RefCell;
 use std::time::Duration;
 
@@ -37,25 +37,26 @@ impl MockStorage {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Storage for MockStorage {
-    fn get(&self, _key: &str) -> SFuture<Cache> {
+    async fn get(&self, _key: &str) -> Result<Cache> {
         let mut g = self.gets.borrow_mut();
         assert!(
             g.len() > 0,
             "MockStorage get called, but no get results available"
         );
-        g.remove(0)
+        g.remove(0).compat().await
     }
-    fn put(&self, _key: &str, _entry: CacheWrite) -> SFuture<Duration> {
-        f_ok(Duration::from_secs(0))
+    async fn put(&self, _key: &str, _entry: CacheWrite) -> Result<Duration> {
+        Ok(Duration::from_secs(0))
     }
     fn location(&self) -> String {
         "Mock Storage".to_string()
     }
-    fn current_size(&self) -> SFuture<Option<u64>> {
-        Box::new(future::ok(None))
+    async fn current_size(&self) -> Result<Option<u64>> {
+        Ok(None)
     }
-    fn max_size(&self) -> SFuture<Option<u64>> {
-        Box::new(future::ok(None))
+    async fn max_size(&self) -> Result<Option<u64>> {
+        Ok(None)
     }
 }

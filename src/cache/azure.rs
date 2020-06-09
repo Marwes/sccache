@@ -16,6 +16,7 @@
 use crate::azure::BlobContainer;
 use crate::azure::*;
 use crate::cache::{Cache, CacheRead, CacheWrite, Storage};
+use futures::compat::*;
 use futures_01::future::Future;
 use std::io;
 use std::rc::Rc;
@@ -50,47 +51,46 @@ impl AzureBlobCache {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Storage for AzureBlobCache {
-    fn get(&self, key: &str) -> SFuture<Cache> {
-        Box::new(
-            self.container
-                .get(key, &self.credentials)
-                .then(|result| match result {
-                    Ok(data) => {
-                        let hit = CacheRead::from(io::Cursor::new(data))?;
-                        Ok(Cache::Hit(hit))
-                    }
-                    Err(e) => {
-                        warn!("Got Azure error: {:?}", e);
-                        Ok(Cache::Miss)
-                    }
-                }),
-        )
+    async fn get(&self, key: &str) -> Result<Cache> {
+        self.container
+            .get(key, &self.credentials)
+            .then(|result| match result {
+                Ok(data) => {
+                    let hit = CacheRead::from(io::Cursor::new(data))?;
+                    Ok(Cache::Hit(hit))
+                }
+                Err(e) => {
+                    warn!("Got Azure error: {:?}", e);
+                    Ok(Cache::Miss)
+                }
+            })
+            .compat()
+            .await
     }
 
-    fn put(&self, key: &str, entry: CacheWrite) -> SFuture<Duration> {
+    async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
         let start = Instant::now();
-        let data = match entry.finish() {
-            Ok(data) => data,
-            Err(e) => return f_err(e),
-        };
+        let data = entry.finish()?;
 
         let response = self
             .container
             .put(key, data, &self.credentials)
             .fcontext("Failed to put cache entry in Azure");
 
-        Box::new(response.map(move |_| start.elapsed()))
+        response.map(move |_| start.elapsed()).compat().await
     }
 
     fn location(&self) -> String {
         format!("Azure, container: {}", self.container)
     }
 
-    fn current_size(&self) -> SFuture<Option<u64>> {
-        f_ok(None)
+    async fn current_size(&self) -> Result<Option<u64>> {
+        Ok(None)
     }
-    fn max_size(&self) -> SFuture<Option<u64>> {
-        f_ok(None)
+
+    async fn max_size(&self) -> Result<Option<u64>> {
+        Ok(None)
     }
 }

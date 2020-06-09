@@ -28,7 +28,6 @@ use crate::mock_command::{exit_status, CommandChild, CommandCreatorSync, RunComm
 use crate::util::{fmt_duration_as_secs, ref_env, run_input_output};
 use filetime::FileTime;
 use futures::{compat::*, prelude::*};
-use futures_01::Future;
 use futures_cpupool::CpuPool;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -44,7 +43,6 @@ use std::str;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use tokio_timer::Timeout;
 
 use crate::errors::*;
 
@@ -232,12 +230,12 @@ where
         // If `ForceRecache` is enabled, we won't check the cache.
         let start = Instant::now();
         let result = if cache_control == CacheControl::ForceRecache {
-            Ok(Cache::Recache)
+            Ok(Ok(Cache::Recache))
         } else {
             // Set a maximum time limit for the cache to respond before we forge
             // ahead ourselves with a compilation.
             let timeout = Duration::new(60, 0);
-            Timeout::new(storage.get(&key), timeout).compat().await
+            tokio::time::timeout(timeout, storage.get(&key)).await
         };
 
         // Check the result of the cache lookup.
@@ -248,57 +246,55 @@ where
             .collect::<HashMap<_, _>>();
 
         let miss_type = match result {
-            Ok(Cache::Hit(mut entry)) => {
-                debug!(
-                    "[{}]: Cache hit in {}",
-                    out_pretty,
-                    fmt_duration_as_secs(&duration)
-                );
-                let stdout = entry.get_stdout();
-                let stderr = entry.get_stderr();
-                entry.extract_objects(outputs, &pool).compat().await?;
-                let output = process::Output {
-                    status: exit_status(0),
-                    stdout,
-                    stderr,
-                };
-                let result = CompileResult::CacheHit(duration);
-                return Ok((result, output));
-            }
-            Ok(Cache::Miss) => {
-                debug!(
-                    "[{}]: Cache miss in {}",
-                    out_pretty,
-                    fmt_duration_as_secs(&duration)
-                );
-                MissType::Normal
-            }
-            Ok(Cache::Recache) => {
-                debug!(
-                    "[{}]: Cache recache in {}",
-                    out_pretty,
-                    fmt_duration_as_secs(&duration)
-                );
-                MissType::ForcedRecache
-            }
-            Err(err) => {
-                if err.is_elapsed() {
+            Ok(result) => match result {
+                Ok(Cache::Hit(mut entry)) => {
                     debug!(
-                        "[{}]: Cache timed out {}",
+                        "[{}]: Cache hit in {}",
                         out_pretty,
                         fmt_duration_as_secs(&duration)
                     );
-                    MissType::TimedOut
-                } else {
+                    let stdout = entry.get_stdout();
+                    let stderr = entry.get_stderr();
+                    entry.extract_objects(outputs, &pool).compat().await?;
+                    let output = process::Output {
+                        status: exit_status(0),
+                        stdout,
+                        stderr,
+                    };
+                    let result = CompileResult::CacheHit(duration);
+                    return Ok((result, output));
+                }
+                Ok(Cache::Miss) => {
+                    debug!(
+                        "[{}]: Cache miss in {}",
+                        out_pretty,
+                        fmt_duration_as_secs(&duration)
+                    );
+                    MissType::Normal
+                }
+                Ok(Cache::Recache) => {
+                    debug!(
+                        "[{}]: Cache recache in {}",
+                        out_pretty,
+                        fmt_duration_as_secs(&duration)
+                    );
+                    MissType::ForcedRecache
+                }
+                Err(err) => {
                     error!("[{}]: Cache read error: {}", out_pretty, err);
-                    if err.is_inner() {
-                        let err = err.into_inner().unwrap();
-                        for e in err.chain().skip(1) {
-                            error!("[{}] \t{}", out_pretty, e);
-                        }
+                    for e in err.chain().skip(1) {
+                        error!("[{}] \t{}", out_pretty, e);
                     }
                     MissType::CacheReadError
                 }
+            },
+            Err(tokio::time::Elapsed { .. }) => {
+                debug!(
+                    "[{}]: Cache timed out {}",
+                    out_pretty,
+                    fmt_duration_as_secs(&duration)
+                );
+                MissType::TimedOut
             }
         };
 
@@ -345,20 +341,21 @@ where
 
         // Try to finish storing the newly-written cache
         // entry. We'll get the result back elsewhere.
-        let future = storage
-            .put(&key, entry)
-            .then(move |res| {
-                match res {
-                    Ok(_) => debug!("[{}]: Stored in cache successfully!", out_pretty),
-                    Err(ref e) => debug!("[{}]: Cache write error: {:?}", out_pretty, e),
-                }
-                res.map(|duration| CacheWriteInfo {
-                    object_file_pretty: out_pretty,
-                    duration,
+        let future = Box::pin(async move {
+            storage
+                .put(&key, entry)
+                .map(move |res| {
+                    match res {
+                        Ok(_) => debug!("[{}]: Stored in cache successfully!", out_pretty),
+                        Err(ref e) => debug!("[{}]: Cache write error: {:?}", out_pretty, e),
+                    }
+                    res.map(|duration| CacheWriteInfo {
+                        object_file_pretty: out_pretty,
+                        duration,
+                    })
                 })
-            })
-            .compat();
-        let future = Box::pin(future);
+                .await
+        });
         Ok((
             CompileResult::CacheMiss(miss_type, dist_type, duration, future),
             compiler_result,
