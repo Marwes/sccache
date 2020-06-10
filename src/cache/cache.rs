@@ -387,5 +387,5 @@ pub fn storage_from_config(config: &Config, pool: &CpuPool) -> Arc<dyn Storage> 
     info!("No configured caches successful, falling back to default");
     let (dir, size) = (&config.fallback_cache.dir, config.fallback_cache.size);
     trace!("Using DiskCache({:?}, {})", dir, size);
-    Arc::new(DiskCache::new(&dir, size, pool))
+    Arc::new(DiskCache::new(&dir, size))
 }

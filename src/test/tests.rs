@@ -19,8 +19,8 @@ use crate::jobserver::Client;
 use crate::mock_command::*;
 use crate::server::{DistClientContainer, SccacheServer, ServerMessage};
 use crate::test::utils::*;
-use futures_01::sync::oneshot::{self, Sender};
 use futures::compat::*;
+use futures_01::sync::oneshot::{self, Sender};
 use futures_cpupool::CpuPool;
 use std::fs::File;
 use std::io::{Cursor, Write};
@@ -78,7 +78,7 @@ where
     let handle = thread::spawn(move || {
         let pool = CpuPool::new(1);
         let dist_client = DistClientContainer::new_disabled();
-        let storage = Arc::new(DiskCache::new(&cache_dir, cache_size, &pool));
+        let storage = Arc::new(DiskCache::new(&cache_dir, cache_size));
 
         let runtime = Runtime::new().unwrap();
         let client = unsafe { Client::new() };
